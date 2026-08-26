@@ -1,0 +1,15 @@
+omp-codex-image-gen is an Oh My Pi port of pi-codex-image-gen.
+
+pi-codex-image-gen
+Copyright 2025-2026 Jose Mocito
+Licensed under the Apache License, Version 2.0.
+Source: https://github.com/jvm/pi-mono/tree/main/packages/pi-codex-image-gen
+
+This package also includes imagegen skill helper files derived from OpenAI Codex.
+
+OpenAI Codex
+Copyright 2025 OpenAI
+Licensed under the Apache License, Version 2.0.
+Source: https://github.com/openai/codex
+
+Vendored OpenAI-derived files are listed in skills/imagegen/LICENSE.txt and remain under the Apache License, Version 2.0.

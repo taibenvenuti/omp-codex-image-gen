@@ -1,0 +1,70 @@
+{
+  "name": "omp-codex-image-gen",
+  "version": "0.1.0",
+  "description": "Image generation for Oh My Pi using the ChatGPT Images 2.0 model.",
+  "type": "module",
+  "license": "Apache-2.0",
+  "x-apache-notice": "Modified by Oh My Pi contributors from pi-codex-image-gen (Apache-2.0).",
+  "keywords": [
+    "omp-package",
+    "oh-my-pi",
+    "omp",
+    "codex",
+    "image-generation",
+    "gpt-image-2"
+  ],
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "files": [
+    "index.ts",
+    "extensions",
+    "src",
+    "skills",
+    "README.md",
+    "NOTICE",
+    "LICENSE",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "CONTRIBUTING.md",
+    "CODE_OF_CONDUCT.md"
+  ],
+  "scripts": {
+    "check": "tsc --noEmit",
+    "typecheck": "tsc --noEmit",
+    "test": "rm -rf .test-dist && tsc --noEmit false --outDir .test-dist && node --import tsx --test tests/*.test.mjs; status=$?; rm -rf .test-dist; exit $status",
+    "pack:dry-run": "npm pack --dry-run"
+  },
+  "omp": {
+    "name": "Codex Image Generation",
+    "description": "Generate and edit images using OMP's existing ChatGPT Codex login.",
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@oh-my-pi/omptype": ">=18.0.5",
+    "@oh-my-pi/pi-coding-agent": ">=18.0.5"
+  },
+  "peerDependenciesMeta": {
+    "@oh-my-pi/omptype": {
+      "optional": true
+    },
+    "@oh-my-pi/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@oh-my-pi/omptype": "^18.0.6",
+    "@oh-my-pi/pi-coding-agent": "^18.0.6",
+    "@types/node": "^26.2.0",
+    "tsx": "^4.22.4",
+    "typescript": "^7.0.2"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=20.6.0"
+  }
+}
