@@ -319,7 +319,8 @@ export async function resolveInputImages(
 	messages: unknown[],
 ): Promise<InputImage[]> {
 	const paths = params.referencedImagePaths ?? [];
-	if (paths.length > 0 && params.numLastImagesToInclude !== undefined) {
+	const count = params.numLastImagesToInclude === 0 ? undefined : params.numLastImagesToInclude; // OMP serializes an omitted optional numeric parameter as 0.
+	if (paths.length > 0 && count !== undefined) {
 		throw new Error("Provide only one of referencedImagePaths or numLastImagesToInclude.");
 	}
 	if (paths.length > MAX_EDIT_IMAGES) throw new Error(`referencedImagePaths accepts at most ${MAX_EDIT_IMAGES} paths.`);
@@ -338,8 +339,7 @@ export async function resolveInputImages(
 			}),
 		);
 	}
-	if (params.numLastImagesToInclude !== undefined) {
-		const count = params.numLastImagesToInclude;
+	if (count !== undefined) {
 		if (!Number.isInteger(count) || count < 1 || count > MAX_EDIT_IMAGES) {
 			throw new Error(`numLastImagesToInclude must be between 1 and ${MAX_EDIT_IMAGES}.`);
 		}

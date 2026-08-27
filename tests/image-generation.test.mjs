@@ -114,6 +114,7 @@ test("edit selectors enforce conflicts, limits, missing paths, and recent image 
   await assert.rejects(resolveInputImages({ prompt: "x", referencedImagePaths: Array(6).fill("x") }, "/tmp", []), /at most 5/);
   await assert.rejects(resolveInputImages({ prompt: "x", referencedImagePaths: ["missing.png"] }, "/tmp", []), /Unable to read/);
   await assert.rejects(resolveInputImages({ prompt: "x", numLastImagesToInclude: 2 }, "/tmp", [{ content: [{ type: "image", data: "a", mimeType: "image/png" }] }]), /only 1/);
+  assert.deepEqual(await resolveInputImages({ prompt: "x", numLastImagesToInclude: 0 }, "/tmp", []), []);
 });
 
 test("recent images are selected newest-first then returned chronologically", () => {
