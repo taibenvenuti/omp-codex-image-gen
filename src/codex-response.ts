@@ -152,7 +152,7 @@ export async function httpFailure(response: Response, signal: AbortSignal): Prom
 	const terminal = isQuota(error)
 		|| error.code === "moderation_blocked" || error.type === "image_generation_user_error";
 	const hint = response.status === 401
-		? "Codex login was rejected. Run /login for openai-codex again."
+		? "Image login was rejected. Run /login codex-images again."
 		: response.status === 403
 			? "Codex access was denied. This can be a connection or account restriction; it does not identify the image model."
 			: errorHint(error);

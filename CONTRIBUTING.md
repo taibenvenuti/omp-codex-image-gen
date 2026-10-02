@@ -22,7 +22,7 @@ pi install -l /path/to/pi-mono/packages/pi-codex-image-gen
 pi
 ```
 
-Then run `/login` for `openai-codex` and ask Pi to generate an image.
+With Pi 0.85.1 or later, run `/login codex-images`, complete the ChatGPT browser login, and ask Pi to generate an image. Chat can stay on `openai` OAuth. Neither the Codex app nor Pi's legacy OAuth helpers are required.
 
 For a one-off run without changing settings:
 
@@ -43,6 +43,14 @@ uv run --no-project python3 skills/imagegen/scripts/remove_chroma_key.py --help
 The vendored CLI changes for Images 2.5 cover documented quality and flexible size settings plus GPT Image 2 transparency preview. They do not change API endpoints, authentication, or defaults.
 
 Optional live smoke test (requires explicit approval to use image quota): load this checkout with `pi -e`, generate one PNG, and edit it using `referencedImagePaths`. Verify inline display and saved bytes. Confirm that progress and the final summary do not invent an image model, and that `backendImageModel` is `"unknown"` unless the backend explicitly reports one. Verify `reportedImage` size/quality/background against the response, then inspect actual pixels for dimensions and alpha. A successful image does not prove which backend model ran. Never include credentials or raw image payloads in test reports.
+
+For auth compatibility, run the smoke test with `/login codex-images` while chat uses `openai` OAuth. Verify the provider appears in `/login`, not `/model`, and that Pi persists the image credential under its own ID. Check `details.provider: "codex-images"` and `details.transport: "codex-responses"`. If legacy Pi `openai-codex` is available, test it separately without owned image credentials; it should report `openai-codex` / `codex-responses`. With both logins, owned image OAuth wins. A selected auth failure must not switch accounts. With only chat OAuth or an API key, the tool must ask for `/login codex-images` before any image request.
+
+Test `/logout codex-images` without changing the chat login. On a remote/headless machine, test the full-redirect-URL fallback and callback-port conflicts. Never paste a callback into chat. Automated tests exercise actual provider registration, Pi login/storage/logout, PKCE/state, loopback/manual callbacks, cancellation, concurrent refresh, and image tool wiring using mocked token/image responses. They do not prove that a fresh live browser grant or a particular account supports the image endpoint.
+
+On October 2, 2026, the maintainer reported that the package-owned flow worked in a live smoke test. This is a user-confirmed result, not automated verification of every account or of the served image model.
+
+On October 2, 2026, live diagnostics with new `openai` plan-sharing OAuth rejected Responses image tools with `subscription_sharing_unsupported_capability`, and direct Images calls with `hardened_oauth_rule_missing`. OpenAI's [preview limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations) list image generation as unsupported. The same chat grant could call a local image function; separate image-capable Codex OAuth produced verified PNGs through both native Images and Codex Responses endpoints. These probes established the grant distinction, not a live test of this package-owned browser login.
 
 ## Subscription capability check
 
@@ -83,7 +91,7 @@ Before opening a pull request:
 - Treat save-mode names, config file keys, and auth flow as public interface; changes to defaults or precedence are breaking changes.
 - Do not modify `skills/imagegen/scripts/image_gen.py` without a documented reason; it is a vendored fallback.
 - The Codex Responses SSE contract is private and may change. If generation breaks, inspect sanitized event types, status codes, and allowlisted output metadata. Never log raw response bodies or auth headers.
-- Avoid requiring `OPENAI_API_KEY` for the normal Pi tool path; auth piggybacks on Pi's `openai-codex` login.
+- Keep the Pi tool subscription-only: prefer package-owned `codex-images` OAuth, preserve available legacy Pi `openai-codex` support, and never use the `openai` chat token, Codex app credentials, or `OPENAI_API_KEY` for tool requests.
 
 ## Code of conduct
 

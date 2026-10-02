@@ -2,14 +2,14 @@
 
 Create and edit images without leaving [Pi](https://pi.dev).
 
-`pi-codex-image-gen` turns natural-language requests and reference images into PNG, JPEG, or WebP assets through **Codex image generation**, using your existing ChatGPT Codex login instead of a separate API key.
+`pi-codex-image-gen` turns natural-language requests and reference images into PNG, JPEG, or WebP assets through **ChatGPT subscription image generation**. Sign in from Pi; no Codex app or separate API key is required.
 
 ## Features
 
 - **Generate images in conversation** — describe the asset you need and let Pi create it.
 - **Edit from references** — transform up to five local or recent conversation images.
 - **Save where work happens** — return images inline or organize them by project, session, or custom directory.
-- **No separate API setup** — reuse your existing ChatGPT Plus/Pro Codex authentication.
+- **Separate image login** — keep Pi chat on `openai` OAuth while the extension handles image authentication.
 
 ## Install
 
@@ -49,7 +49,7 @@ The tool reports generation stages and the backend's returned size, quality, bac
 
 ### Subscription reliability and limits
 
-- Requests identify this package with a Pi User-Agent. There is no Codex impersonation, browser-cookie import, or paid API fallback.
+- Requests identify this package with a Pi User-Agent. The image login uses the Codex-compatible public OAuth client; it does not launch the Codex app, read its credentials, import browser cookies, or fall back to paid API calls.
 - One five-minute network deadline covers the connection, retries, and stream. Escape cancels network work; the remote generation may still finish.
 - Prompts: 32,000 characters. References: five regular PNG/JPEG/WebP files or conversation images, at most 20 MiB each and 50 MiB combined.
 - Responses: 100 MiB total, with at most one 32 MiB decoded output image. Base64 and format signatures are checked; this is not a full image decoder. Backend text and revised prompts are limited to 4,000 characters; HTTP error bodies are read only up to 16 KiB and are not displayed.
@@ -69,13 +69,21 @@ In subscription tests on September 11, 2026, the direct endpoint accepted Flare,
 
 ## Authentication
 
-Uses your existing **openai-codex** login — no `OPENAI_API_KEY` required. If you haven't logged in yet:
+The extension owns an image-capable ChatGPT OAuth flow, registered as **Codex Images** (`codex-images`). Pi stores its credentials and handles refresh. Your chat provider can remain `openai`; image authentication is independent.
 
 ```
-> /login
+> /login codex-images
 ```
 
-Select **ChatGPT Plus/Pro (Codex)** and complete the OAuth flow.
+Complete the browser login with your ChatGPT account. You can also run `/login` and select **Codex Images (ChatGPT subscription)**. The browser redirects to `http://localhost:1455/auth/callback`. If the callback cannot reach Pi, paste the **full redirect URL** into Pi's login prompt, not into chat. Login expires after ten minutes.
+
+Use Pi 0.85.1 or later. Pi stores the `codex-images` credential in its agent auth store (normally `~/.pi/agent/auth.json`). `/logout codex-images` removes that credential without changing your chat login. No credential files are created by the extension itself.
+
+The package implements the Codex-compatible OAuth protocol itself. It neither imports Pi's `openai-codex` OAuth helpers nor requires the Codex app or its credential store. It still depends on OpenAI continuing to accept that public OAuth client and private image endpoint; this is not a new OAuth application registered with OpenAI.
+
+Existing Pi `openai-codex` credentials remain a compatibility fallback when `codex-images` credentials are absent and the legacy provider is available. With both image logins, `codex-images` wins. A selected login that fails to refresh or generate does not switch to another account.
+
+Both image logins use `https://chatgpt.com/backend-api/codex/responses`. Pi's new `openai` plan-sharing OAuth grant is different and [does not support image generation](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations). The extension never sends that chat token to the Codex backend. API keys do **not** enable this tool or API-key billing.
 
 ## Configuration
 
@@ -136,8 +144,8 @@ Project config overrides global config only when project trust is active. If pro
 
 ## How it works
 
-1. Resolves auth via Pi's `openai-codex` provider (ChatGPT session token).
-2. Sends a Codex Responses API request to the routing model (default `gpt-5.5`) with the `image_generation` tool enabled.
+1. Resolves package-owned `codex-images` OAuth via Pi, or falls back to available legacy Pi `openai-codex` OAuth.
+2. Sends a request to the Codex Responses endpoint and routing model (default `gpt-5.5`) with the `image_generation` tool enabled.
 3. For edits, attaches the selected local or conversation images to the request.
 4. The backend selects an image model to generate or edit the image.
 5. Parses the SSE stream and strictly validates the returned base64 and image format.
@@ -148,8 +156,8 @@ Project config overrides global config only when project trust is active. If pro
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
-| "Missing openai-codex credentials" | Not logged in | Run `/login` and select **ChatGPT Plus/Pro (Codex)** |
-| 401 / 403 response | Token expired | Re-run `/login` for openai-codex |
+| "Missing image OAuth credentials" | No image-capable subscription login; chat OAuth and API keys are not sufficient | Run `/login codex-images` |
+| 401 / 403 response | Image login rejected or token expired | Re-run `/login codex-images` |
 | 429 response | Rate limited | Wait and retry; the extension retries automatically with backoff |
 | "Codex did not return an image" | Backend refused the prompt | Rephrase the prompt and try again |
 | "save=custom requires saveDir" | Missing config | Set `saveDir` in config or `PI_CODEX_IMAGE_SAVE_DIR` env var |

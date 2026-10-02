@@ -1,8 +1,8 @@
 /**
  * Project-local Codex image generation extension.
  *
- * Registers `codex_generate_image`, a tool that uses Pi's existing
- * openai-codex ChatGPT/Codex auth to call the Codex Responses backend with the
+ * Registers `codex_generate_image`, a tool that uses package-owned
+ * ChatGPT image OAuth or legacy Pi auth to call the Codex Responses backend with the
  * native `image_generation` tool. The backend selects the image model.
  */
 
@@ -12,16 +12,16 @@ import { mkdir, open, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { CONFIG_DIR_NAME, type ExtensionAPI, getAgentDir, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
+import { CONFIG_DIR_NAME, type ExtensionAPI, type ExtensionContext, getAgentDir, withFileMutationQueue } from "@earendil-works/pi-coding-agent";
 import { type Static, Type } from "typebox";
 import { reportInstallTelemetry } from "../src/install-telemetry.js";
+import { extractImageAccountId, imageAuthProvider, IMAGE_AUTH_PROVIDER } from "../src/image-oauth.js";
 import { abortable, httpFailure, MAX_IMAGE_BYTES, parseCodexSse, withRequestDeadline, type ParsedCodexResponse } from "../src/codex-response.js";
 
 const PACKAGE_NAME = "pi-codex-image-gen";
-const PROVIDER = "openai-codex";
+const LEGACY_PROVIDER = "openai-codex";
 const DEFAULT_MODEL = "gpt-5.5";
 const CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
-const JWT_CLAIM_PATH = "https://api.openai.com/auth";
 const DEFAULT_SAVE_MODE = "global";
 const OPENAI_BETA_HEADER = "responses=experimental";
 const MAX_RETRIES = 3;
@@ -135,31 +135,34 @@ interface InputImage {
 	mimeType: string;
 }
 
-// --- JWT helpers ---
+// --- Image credentials (independent of the active chat provider) ---
 
-function decodeJwtPayload(token: string): Record<string, unknown> {
-	const parts = token.split(".");
-	if (parts.length !== 3 || !parts[1]) {
-		throw new Error("OpenAI Codex auth token is not a JWT. Run /login for openai-codex again.");
-	}
-	try {
-		return JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8")) as Record<string, unknown>;
-	} catch {
-		throw new Error("Failed to decode OpenAI Codex auth token. Run /login for openai-codex again.");
-	}
+interface ImageAuth {
+	provider: typeof IMAGE_AUTH_PROVIDER | typeof LEGACY_PROVIDER;
+	token: string;
+	accountId: string;
 }
 
-function extractChatGptAccountId(token: string): string {
-	const payload = decodeJwtPayload(token);
-	const authClaims = payload[JWT_CLAIM_PATH];
-	if (!authClaims || typeof authClaims !== "object") {
-		throw new Error("OpenAI Codex auth token does not contain ChatGPT auth claims. Run /login for openai-codex again.");
+async function resolveImageAuth(registry: ExtensionContext["modelRegistry"]): Promise<ImageAuth> {
+	for (const provider of [IMAGE_AUTH_PROVIDER, LEGACY_PROVIDER] as const) {
+		let token: string | undefined;
+		try {
+			if (typeof registry.getProviderAuth === "function") {
+				const resolved = await registry.getProviderAuth(provider);
+				if (resolved && resolved.source !== "OAuth") {
+					throw new Error("Image credentials must use OAuth.");
+				}
+				token = resolved?.auth.apiKey;
+				if (resolved && !token) throw new Error("Missing image access token.");
+			} else {
+				token = await registry.getApiKeyForProvider(provider);
+			}
+		} catch {
+			throw new Error(`Image authentication failed for ${provider}. Run /login ${IMAGE_AUTH_PROVIDER} again. No alternate account was used.`);
+		}
+		if (token) return { provider, token, accountId: extractImageAccountId(token) };
 	}
-	const accountId = (authClaims as Record<string, unknown>).chatgpt_account_id;
-	if (typeof accountId !== "string" || accountId.length === 0) {
-		throw new Error("OpenAI Codex auth token does not contain chatgpt_account_id. Run /login for openai-codex again.");
-	}
-	return accountId;
+	throw new Error(`Missing image OAuth credentials. Run /login ${IMAGE_AUTH_PROVIDER}. Pi's openai plan-sharing OAuth does not support images; API keys and Codex app credentials are not used.`);
 }
 
 // --- #10: try/catch readConfigFile replaces racy existsSync + readFileSync ---
@@ -407,8 +410,7 @@ export function buildRequestBody(
 
 async function requestImage(
 	params: ToolParams,
-	token: string,
-	accountId: string,
+	auth: ImageAuth,
 	model: string,
 	outputFormat: OutputFormat,
 	sessionId: string,
@@ -418,8 +420,8 @@ async function requestImage(
 ): Promise<ParsedCodexResponse> {
 	const body = JSON.stringify(buildRequestBody(params, model, outputFormat, sessionId, inputImages));
 	const headers: Record<string, string> = {
-		Authorization: `Bearer ${token}`,
-		"chatgpt-account-id": accountId,
+		Authorization: `Bearer ${auth.token}`,
+		"chatgpt-account-id": auth.accountId,
 		originator: "pi",
 		"User-Agent": PACKAGE_NAME,
 		"OpenAI-Beta": OPENAI_BETA_HEADER,
@@ -450,7 +452,7 @@ async function requestImage(
 				throw new Error(failure.message);
 			}
 
-			return parseCodexSse(response, signal, [token, accountId], onProgress);
+			return parseCodexSse(response, signal, [auth.token, auth.accountId], onProgress);
 		}
 		throw new Error("Codex image generation request failed after all retries.");
 	});
@@ -460,12 +462,13 @@ async function requestImage(
 
 export default function codexImageGen(pi: ExtensionAPI) {
 	reportInstallTelemetry();
+	pi.registerProvider(imageAuthProvider);
 
 	pi.registerTool({
 		name: "codex_generate_image",
 		label: "Codex Image",
 		description:
-			"Generate or edit an image with the OpenAI Codex ChatGPT backend built-in image_generation tool. The backend selects the image model. Accepts up to five local or recent conversation images (20 MiB each, 50 MiB total). Uses the existing openai-codex login; does not require OPENAI_API_KEY. Network deadline: 5 minutes; output image limit: 32 MiB; backend text is limited to 4,000 characters.",
+			"Generate or edit an image with the OpenAI Codex ChatGPT backend built-in image_generation tool. The backend selects the image model. Accepts up to five local or recent conversation images (20 MiB each, 50 MiB total). Requires /login codex-images or existing legacy Pi OAuth credentials; works with openai OAuth chat and does not require the Codex app or an API key. Network deadline: 5 minutes; output image limit: 32 MiB; backend text is limited to 4,000 characters.",
 		promptSnippet: "Generate or edit bitmap images via the OpenAI Codex ChatGPT backend image_generation tool.",
 		promptGuidelines: [
 			"Use codex_generate_image when the user asks to generate or edit a raster image with OpenAI/Codex image generation.",
@@ -491,14 +494,11 @@ export default function codexImageGen(pi: ExtensionAPI) {
 			if (requestedModel.startsWith("gpt-image-")) {
 				throw new Error("The model parameter selects a Codex routing model, not an image model. Subscription image-model selection is not verified.");
 			}
-			const model = ctx.modelRegistry.find(PROVIDER, requestedModel)?.id || requestedModel; // #6: removed dead FALLBACK_MODEL
 			const sessionId = ctx.sessionManager.getSessionId();
 			const saveConfig = resolveSaveConfig(params, ctx.cwd, sessionId, config);
-			const token = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER);
-			if (!token) {
-				throw new Error(`Missing ${PROVIDER} credentials. Run /login and select ChatGPT Plus/Pro (Codex).`);
-			}
-			const accountId = extractChatGptAccountId(token);
+			const auth = await resolveImageAuth(ctx.modelRegistry);
+			const provider = auth.provider;
+			const model = ctx.modelRegistry.find(provider, requestedModel)?.id || requestedModel;
 			const messages: unknown[] = [];
 			for (const entry of ctx.sessionManager.getBranch()) {
 				if (entry.type === "message") messages.push(entry.message);
@@ -507,15 +507,15 @@ export default function codexImageGen(pi: ExtensionAPI) {
 			const inputImages = await resolveInputImages(params, ctx.cwd, messages);
 
 			onUpdate?.({
-				content: [{ type: "text", text: `Requesting image ${inputImages.length > 0 ? "edit" : "generation"} through ${PROVIDER}/${model}...` }],
-				details: { provider: PROVIDER, model, outputFormat, inputImageCount: inputImages.length },
+				content: [{ type: "text", text: `Requesting image ${inputImages.length > 0 ? "edit" : "generation"} through ${provider}/${model}...` }],
+				details: { provider, model, outputFormat, inputImageCount: inputImages.length },
 			});
 
 			const started = Date.now();
-			const parsed = await requestImage(params, token, accountId, model, outputFormat, sessionId, inputImages, signal, (stage) => {
+			const parsed = await requestImage(params, auth, model, outputFormat, sessionId, inputImages, signal, (stage) => {
 				onUpdate?.({
 					content: [{ type: "text", text: `Codex image stage: ${stage}.` }],
-					details: { provider: PROVIDER, model, stage },
+					details: { provider, model, stage },
 				});
 			});
 			if (!parsed.image) {
@@ -534,7 +534,7 @@ export default function codexImageGen(pi: ExtensionAPI) {
 					savedPath = await saveImage(imageBytes, outputFormat, saveConfig.outputDir, parsed.image.id || toolCallId);
 					onUpdate?.({
 						content: [{ type: "text", text: `Image saved to ${savedPath}.` }],
-						details: { provider: PROVIDER, model, savedPath, byteCount: imageBytes.length },
+						details: { provider, model, savedPath, byteCount: imageBytes.length },
 					});
 				} catch (error) {
 					saveWarning = `Image generation succeeded, but the image could not be saved to disk: ${error instanceof Error ? error.message : String(error)}`;
@@ -542,7 +542,7 @@ export default function codexImageGen(pi: ExtensionAPI) {
 			}
 
 			const summary = [
-				`Generated image via ${PROVIDER}/${model} using the backend-selected image model.`,
+				`Generated image via ${provider}/${model} using the backend-selected image model.`,
 				`Status: ${parsed.image.status}.`,
 				reportedImage.size ? `Backend-reported size: ${reportedImage.size}.` : undefined,
 				reportedImage.quality ? `Backend-reported quality: ${reportedImage.quality}.` : undefined,
@@ -560,7 +560,7 @@ export default function codexImageGen(pi: ExtensionAPI) {
 					{ type: "image", data: parsed.image.result, mimeType: mimeForFormat(outputFormat) },
 				],
 				details: {
-					provider: PROVIDER,
+					provider,
 					model,
 					backendImageModel: reportedImage.model ?? "unknown",
 					reportedImage,

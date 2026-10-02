@@ -3,6 +3,9 @@ import { mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { createModels, InMemoryCredentialStore } from "@earendil-works/pi-ai";
+import { ModelRegistry } from "@earendil-works/pi-coding-agent";
+import { IMAGE_AUTH_PROVIDER } from "../.test-dist/src/image-oauth.js";
 import { MAX_RESPONSE_BYTES, REQUEST_TIMEOUT_MS } from "../.test-dist/src/codex-response.js";
 
 import extension, {
@@ -36,9 +39,10 @@ function sseResponse(image = PNG.toString("base64")) {
   });
 }
 
-function createTool() {
+function createTool(registerProvider = () => {}) {
   let tool;
   extension({
+    registerProvider,
     registerTool(value) { tool = value; },
   });
   assert.ok(tool);
@@ -51,7 +55,7 @@ function context(cwd, messages = []) {
     isProjectTrusted: () => false,
     modelRegistry: {
       find: () => undefined,
-      getApiKeyForProvider: async () => jwt(),
+      getApiKeyForProvider: async provider => provider === "openai-codex" ? jwt() : undefined,
     },
     sessionManager: {
       getSessionId: () => "session-1",
@@ -231,7 +235,7 @@ test("malformed backend payload fails before saving or returning image content",
   await assert.rejects(readFile(join(cwd, "out", "session-1", "image-1.png")));
 });
 
-async function harness(t, responder) {
+async function harness(t, responder, registerProvider) {
   const cwd = await mkdtemp(join(tmpdir(), "imagegen-contract-"));
   t.after(() => rm(cwd, { recursive: true, force: true }));
   const originalFetch = globalThis.fetch;
@@ -241,7 +245,7 @@ async function harness(t, responder) {
     calls.push({ url, ...init });
     return responder(url, init);
   };
-  const tool = createTool();
+  const tool = createTool(registerProvider);
   return {
     cwd, calls, tool,
     run: (params = {}, signal, onUpdate, ctx = context(cwd)) =>
@@ -270,12 +274,180 @@ function streamEvents(events, { crlf = false, fragment = false, close = true, ca
 
 test("tool sends an honest Pi User-Agent, blocks redirects, and retains the subscription route", async (t) => {
   const h = await harness(t, () => sseResponse());
-  await h.run();
+  const result = await h.run();
   assert.equal(h.calls[0].url, "https://chatgpt.com/backend-api/codex/responses");
   assert.equal(h.calls[0].headers["User-Agent"], "pi-codex-image-gen");
   assert.equal(h.calls[0].headers.originator, "pi");
+  assert.equal(h.calls[0].headers["chatgpt-account-id"], "account");
+  assert.equal(h.calls[0].headers.Authorization, `Bearer ${jwt()}`);
+  assert.equal(result.details.provider, "openai-codex");
+  assert.equal(result.details.transport, "codex-responses");
   assert.equal(h.calls[0].redirect, "error");
   assert.ok(h.calls[0].signal instanceof AbortSignal);
+});
+
+test("registered image provider refreshes stored OAuth and generates while chat uses openai", async (t) => {
+  const token = jwt();
+  const credentials = new InMemoryCredentialStore();
+  await credentials.modify(IMAGE_AUTH_PROVIDER, async () => ({
+    type: "oauth", access: "expired-test-token", refresh: "test-only-refresh", expires: 0,
+  }));
+  let refreshes = 0;
+  const models = createModels({ credentials });
+  const h = await harness(t, (url, init) => {
+    if (url === "https://auth.openai.com/oauth/token") {
+      refreshes++;
+      assert.equal(init.body.get("grant_type"), "refresh_token");
+      assert.equal(init.body.get("refresh_token"), "test-only-refresh");
+      assert.equal(init.redirect, "error");
+      return Response.json({ access_token: token, refresh_token: "rotated-test-refresh", expires_in: 3600 });
+    }
+    return sseResponse();
+  }, provider => {
+    assert.equal(provider.id, IMAGE_AUTH_PROVIDER);
+    assert.deepEqual(provider.getModels(), []);
+    models.setProvider(provider);
+  });
+  const lookups = [];
+  const registry = new ModelRegistry({
+    getAuth: provider => {
+      assert.notEqual(provider, "openai");
+      return models.getAuth(provider);
+    },
+    getModel(provider, id) { lookups.push([provider, id]); return { id }; },
+  });
+  const ctx = { ...context(h.cwd), model: { provider: "openai" }, modelRegistry: registry };
+  const updates = [];
+  const result = await h.run({ model: "gpt-5.5" }, undefined, update => updates.push(update), ctx);
+  assert.equal(refreshes, 1);
+  assert.deepEqual(lookups, [[IMAGE_AUTH_PROVIDER, "gpt-5.5"]]);
+  assert.equal(h.calls.length, 2);
+  const request = h.calls[1];
+  assert.equal(request.url, "https://chatgpt.com/backend-api/codex/responses");
+  assert.equal(request.headers.Authorization, `Bearer ${token}`);
+  assert.equal(request.headers["chatgpt-account-id"], "account");
+  assert.equal(request.headers["User-Agent"], "pi-codex-image-gen");
+  assert.equal(request.redirect, "error");
+  assert.ok(request.signal instanceof AbortSignal);
+  const body = JSON.parse(request.body);
+  assert.equal(body.model, "gpt-5.5");
+  assert.deepEqual(body.tools, [{ type: "image_generation", output_format: "png" }]);
+  assert.equal(result.details.provider, IMAGE_AUTH_PROVIDER);
+  assert.equal(result.details.transport, "codex-responses");
+  assert.ok(updates.every(update => update.details.provider === IMAGE_AUTH_PROVIDER));
+  assert.doesNotMatch(JSON.stringify([updates, result]), /test-only|expired-test/);
+  assert.equal((await credentials.read(IMAGE_AUTH_PROVIDER)).refresh, "rotated-test-refresh");
+});
+
+test("tool prefers package-owned OAuth when both image logins exist", async (t) => {
+  const h = await harness(t, () => sseResponse());
+  const ctx = context(h.cwd);
+  ctx.modelRegistry.getProviderAuth = async provider => {
+    assert.equal(provider, IMAGE_AUTH_PROVIDER);
+    return { source: "OAuth", auth: { apiKey: jwt() } };
+  };
+  ctx.modelRegistry.getApiKeyForProvider = async () => assert.fail("Legacy login must not be resolved");
+  const result = await h.run({}, undefined, undefined, ctx);
+  assert.equal(result.details.provider, IMAGE_AUTH_PROVIDER);
+});
+
+test("tool falls back to legacy auth only when package-owned credentials are absent", async (t) => {
+  const h = await harness(t, () => sseResponse());
+  const ctx = context(h.cwd);
+  const authLookups = [];
+  ctx.modelRegistry.getProviderAuth = async provider => {
+    authLookups.push(provider);
+    return provider === "openai-codex" ? { source: "OAuth", auth: { apiKey: jwt() } } : undefined;
+  };
+  ctx.modelRegistry.getApiKeyForProvider = async () => assert.fail("Use the OAuth-aware auth contract");
+  const result = await h.run({}, undefined, undefined, ctx);
+  assert.deepEqual(authLookups, [IMAGE_AUTH_PROVIDER, "openai-codex"]);
+  assert.equal(result.details.provider, "openai-codex");
+  assert.equal(h.calls[0].url, "https://chatgpt.com/backend-api/codex/responses");
+  assert.equal(h.calls[0].headers.Authorization, `Bearer ${jwt()}`);
+});
+
+test("tool rejects missing subscription auth and API-key-only auth before a request", async (t) => {
+  for (const resolved of [undefined, { source: "OPENAI_API_KEY", auth: { apiKey: "test-only-paid-key" } },
+    { source: "OAuth", auth: {} }]) {
+    await t.test(resolved?.source ?? "missing", async t => {
+      const h = await harness(t, () => assert.fail("No image request is allowed"));
+      const ctx = context(h.cwd);
+      ctx.modelRegistry.getProviderAuth = async provider => {
+        assert.notEqual(provider, "openai");
+        return resolved;
+      };
+      ctx.modelRegistry.getApiKeyForProvider = async () => undefined;
+      await assert.rejects(h.run({}, undefined, undefined, ctx), error =>
+        /login codex-images/.test(error.message) && !error.message.includes("test-only-paid-key"));
+      assert.equal(h.calls.length, 0);
+    });
+  }
+});
+
+test("tool edits and saves images through package-owned OAuth", async (t) => {
+  const h = await harness(t, () => sseResponse());
+  await writeFile(join(h.cwd, "source.png"), PNG);
+  const ctx = context(h.cwd);
+  ctx.modelRegistry.getProviderAuth = async () => ({
+    source: "OAuth", auth: { apiKey: jwt() },
+  });
+  const result = await h.run({
+    referencedImagePaths: ["source.png"], save: "custom", saveDir: "out",
+  }, undefined, undefined, ctx);
+  assert.equal(h.calls[0].url, "https://chatgpt.com/backend-api/codex/responses");
+  assert.equal(JSON.parse(h.calls[0].body).input[0].content[1].image_url, `data:image/png;base64,${PNG.toString("base64")}`);
+  assert.equal(result.details.inputImageCount, 1);
+  assert.equal(result.details.transport, "codex-responses");
+  assert.deepEqual(await readFile(result.details.savedPath), PNG);
+});
+
+test("legacy JWT payloads that are not objects fail with a safe login error", async (t) => {
+  for (const payload of [null, [], "PRIVATE_PAYLOAD"]) {
+    await t.test(JSON.stringify(payload), async t => {
+      const h = await harness(t, () => assert.fail("Invalid legacy auth must not be sent"));
+      const ctx = context(h.cwd);
+      const token = `header.${Buffer.from(JSON.stringify(payload)).toString("base64url")}.signature`;
+      ctx.modelRegistry.getApiKeyForProvider = async provider => provider === "openai-codex" ? token : undefined;
+      await assert.rejects(h.run({}, undefined, undefined, ctx), error =>
+        /login codex-images/.test(error.message) && !error.message.includes(token));
+      assert.equal(h.calls.length, 0);
+    });
+  }
+});
+
+test("tool sanitizes image OAuth refresh errors and does not fall back to another account", async (t) => {
+  const h = await harness(t, () => assert.fail("No image request is allowed"));
+  const ctx = context(h.cwd);
+  const authLookups = [];
+  ctx.modelRegistry.getProviderAuth = async provider => {
+    authLookups.push(provider);
+    throw new Error("PRIVATE_TOKEN_RESPONSE");
+  };
+  ctx.modelRegistry.getApiKeyForProvider = async () => assert.fail("Do not switch accounts on refresh failure");
+  await assert.rejects(h.run({}, undefined, undefined, ctx), error =>
+    /login codex-images/.test(error.message) && !error.message.includes("PRIVATE_TOKEN_RESPONSE"));
+  assert.equal(h.calls.length, 0);
+  assert.deepEqual(authLookups, [IMAGE_AUTH_PROVIDER]);
+});
+
+test("image OAuth failure does not retry with legacy auth and redacts tokens", async (t) => {
+  const token = jwt();
+  const h = await harness(t, () => streamEvents([
+    { type: "response.output_text.delta", delta: token },
+    { type: "response.completed", response: {} },
+  ]));
+  const ctx = context(h.cwd);
+  const authLookups = [];
+  ctx.modelRegistry.getProviderAuth = async provider => {
+    authLookups.push(provider);
+    return { source: "OAuth", auth: { apiKey: token } };
+  };
+  ctx.modelRegistry.getApiKeyForProvider = async () => assert.fail("Do not retry via legacy auth");
+  await assert.rejects(h.run({}, undefined, undefined, ctx), error =>
+    /did not return an image/.test(error.message) && !error.message.includes(token));
+  assert.equal(h.calls.length, 1);
+  assert.deepEqual(authLookups, [IMAGE_AUTH_PROVIDER]);
 });
 
 test("tool handles fragmented CRLF events and reports backend metadata and progress", async (t) => {

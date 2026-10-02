@@ -26,6 +26,7 @@ Within CLI fallback, the CLI exposes three subcommands:
 
 Rules:
 - Use the Pi `codex_generate_image` tool by default for new image generation requests.
+- Image login is separate from chat: use `/login codex-images` and complete the ChatGPT OAuth flow in Pi. The Codex app is not required. Existing legacy Pi `openai-codex` OAuth can be a fallback; new `openai` plan-sharing chat OAuth cannot generate images. Never ask the user to paste login URLs or tokens into chat.
 - The tool's `model` parameter selects a Codex routing model, not Flare or Sunburst. Do not claim a specific served image model unless the response reports it. Read `details.reportedImage` for backend-reported output settings, then inspect the actual image; prompt requests for quality, dimensions, or transparency are not guarantees.
 - Do not automatically repeat quota, connection, timeout, or incomplete-stream failures. The remote generation may already have consumed quota.
 - Use `referencedImagePaths` for edits when every target has a local path. Use `numLastImagesToInclude` only when a target is available solely in recent conversation history. Never provide both selectors. Masks and advanced CLI-only controls still require confirmed CLI fallback.
