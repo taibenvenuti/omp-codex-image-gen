@@ -20,7 +20,7 @@ import { abortable, httpFailure, MAX_IMAGE_BYTES, parseCodexSse, withRequestDead
 
 const PACKAGE_NAME = "pi-codex-image-gen";
 const LEGACY_PROVIDER = "openai-codex";
-const DEFAULT_MODEL = "gpt-5.5";
+const DEFAULT_MODEL = "gpt-6-astra";
 const CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
 const DEFAULT_SAVE_MODE = "global";
 const OPENAI_BETA_HEADER = "responses=experimental";

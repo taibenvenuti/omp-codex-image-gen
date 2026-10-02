@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -62,6 +62,15 @@ function context(cwd, messages = []) {
       getBranch: () => messages.map((message) => ({ type: "message", message })),
     },
   };
+}
+
+function isolateAgentDir(t, cwd) {
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = join(cwd, "isolated-agent");
+  t.after(() => {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+  });
 }
 
 test("strict image decoding accepts matching formats", () => {
@@ -145,9 +154,10 @@ test("tool edit request includes local image content", async (t) => {
   assert.equal(requestBody.input[0].content[1].type, "input_image");
 });
 
-test("tool leaves image model selection to Codex and does not claim a model ID", async (t) => {
+test("tool defaults to GPT-6 Astra while leaving image model selection to Codex", async (t) => {
   const cwd = await mkdtemp(join(tmpdir(), "imagegen-model-"));
   t.after(() => rm(cwd, { recursive: true, force: true }));
+  isolateAgentDir(t, cwd);
   const originalFetch = globalThis.fetch;
   t.after(() => { globalThis.fetch = originalFetch; });
   let body;
@@ -159,7 +169,10 @@ test("tool leaves image model selection to Codex and does not claim a model ID",
   const updates = [];
   const result = await tool.execute("call", { prompt: "test", save: "none" }, undefined,
     (update) => updates.push(update), context(cwd));
-  assert.equal(body.model, "gpt-5.5");
+  assert.equal(body.model, "gpt-6-astra");
+  assert.match(tool.parameters.properties.model.description, /Defaults to gpt-6-astra/);
+  assert.equal(result.details.model, "gpt-6-astra");
+  assert.ok(updates.every(update => update.details.model === "gpt-6-astra"));
   assert.deepEqual(body.tools, [{ type: "image_generation", output_format: "png" }]);
   assert.equal(result.details.backendImageModel, "unknown");
   assert.doesNotMatch(JSON.stringify([tool.description, tool.promptSnippet, updates, result]), /gpt-image-/);
@@ -284,6 +297,29 @@ test("tool sends an honest Pi User-Agent, blocks redirects, and retains the subs
   assert.equal(result.details.transport, "codex-responses");
   assert.equal(h.calls[0].redirect, "error");
   assert.ok(h.calls[0].signal instanceof AbortSignal);
+});
+
+test("owned image OAuth uses the Astra default and preserves config and per-call routing overrides", async (t) => {
+  const h = await harness(t, () => sseResponse());
+  isolateAgentDir(t, h.cwd);
+  const ctx = context(h.cwd);
+  ctx.modelRegistry.getProviderAuth = async provider => {
+    assert.equal(provider, IMAGE_AUTH_PROVIDER);
+    return { source: "OAuth", auth: { apiKey: jwt() } };
+  };
+  const defaultResult = await h.run({}, undefined, undefined, ctx);
+  await mkdir(join(h.cwd, ".pi", "extensions"), { recursive: true });
+  await writeFile(join(h.cwd, ".pi", "extensions", "codex-image-gen.json"),
+    JSON.stringify({ model: "gpt-6.1-sol" }));
+  ctx.isProjectTrusted = () => true;
+  const configuredResult = await h.run({}, undefined, undefined, ctx);
+  const explicitResult = await h.run({ model: "gpt-5.5" }, undefined, undefined, ctx);
+  assert.deepEqual(h.calls.map(call => JSON.parse(call.body).model),
+    ["gpt-6-astra", "gpt-6.1-sol", "gpt-5.5"]);
+  assert.deepEqual([defaultResult, configuredResult, explicitResult].map(result => result.details.model),
+    ["gpt-6-astra", "gpt-6.1-sol", "gpt-5.5"]);
+  assert.ok([defaultResult, configuredResult, explicitResult].every(result =>
+    result.details.provider === IMAGE_AUTH_PROVIDER && result.details.backendImageModel === "unknown"));
 });
 
 test("registered image provider refreshes stored OAuth and generates while chat uses openai", async (t) => {

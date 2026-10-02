@@ -6,6 +6,12 @@ This project follows the spirit of [Keep a Changelog](https://keepachangelog.com
 
 ## [Unreleased]
 
+## [0.1.15] - 2026-10-02
+
+### Changed
+
+- Use `gpt-6-astra` as the default Codex image-routing model instead of `gpt-5.5`. Preserve explicit tool/configuration overrides and backend-selected image rendering.
+
 ## [0.1.14] - 2026-10-02
 
 ### Added

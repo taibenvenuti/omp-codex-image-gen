@@ -100,7 +100,7 @@ Project config overrides global config only when project trust is active. If pro
 {
   "save": "global",
   "saveDir": "~/Pictures/generated",
-  "model": "gpt-5.5"
+  "model": "gpt-6-astra"
 }
 ```
 
@@ -110,7 +110,7 @@ Project config overrides global config only when project trust is active. If pro
 | --------- | ------ | ---------- | ---------------------------------------- |
 | `save`    | string | `"global"` | Default save mode (see below).           |
 | `saveDir` | string | —          | Directory used when `save=custom`.       |
-| `model`   | string | `"gpt-5.5"`| Codex routing model, not the backend image model. |
+| `model`   | string | `"gpt-6-astra"`| Codex routing model, not the backend image model. |
 
 ### Environment variables
 
@@ -135,7 +135,7 @@ Project config overrides global config only when project trust is active. If pro
 | Parameter      | Type   | Required | Description                                                        |
 | -------------- | ------ | -------- | ------------------------------------------------------------------ |
 | `prompt`       | string | ✅        | The image generation prompt.                                       |
-| `model`        | string | —        | Override the Codex model. Defaults to config or `gpt-5.5`.         |
+| `model`        | string | —        | Override the Codex model. Defaults to config or `gpt-6-astra`.     |
 | `outputFormat` | string | —        | `png` (default), `jpeg`, or `webp`.                                |
 | `save`         | string | —        | Override save mode for this call.                                  |
 | `saveDir`      | string | —        | Directory when `save=custom`. Relative paths resolve under CWD.    |
@@ -145,7 +145,7 @@ Project config overrides global config only when project trust is active. If pro
 ## How it works
 
 1. Resolves package-owned `codex-images` OAuth via Pi, or falls back to available legacy Pi `openai-codex` OAuth.
-2. Sends a request to the Codex Responses endpoint and routing model (default `gpt-5.5`) with the `image_generation` tool enabled.
+2. Sends a request to the Codex Responses endpoint and routing model (default `gpt-6-astra`) with the `image_generation` tool enabled.
 3. For edits, attaches the selected local or conversation images to the request.
 4. The backend selects an image model to generate or edit the image.
 5. Parses the SSE stream and strictly validates the returned base64 and image format.
