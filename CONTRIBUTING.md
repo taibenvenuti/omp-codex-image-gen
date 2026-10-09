@@ -74,7 +74,7 @@ Future probes should use a known-working control, one changed setting at a time,
 ## Pull request checklist
 
 - Keep extension logic in `extensions/index.ts` and `src/` unless there is a clear reason to split.
-- When changing tool parameters, update both the `@oh-my-pi/omptype` schema and the tool description/prompt text — OMP surfaces both to the model.
+- When changing tool parameters, update the `ToolParams` interface, the schema built with OMP's injected `omp.arktype`, and the tool description/prompt text — OMP surfaces the schema and description to the model. Keep runtime imports dependency-free so Git marketplace installs load without `npm install`.
 - Treat save-mode names, config file keys, and auth flow as public interface; changes to defaults or precedence are breaking changes.
 - Do not modify `skills/imagegen/scripts/image_gen.py` without a documented reason; it is a vendored fallback.
 - The Codex Responses SSE contract is private and may change. If generation breaks, inspect sanitized event types, status codes, and allowlisted output metadata. Never log raw response bodies or auth headers.

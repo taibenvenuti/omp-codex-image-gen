@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
 import test from "node:test";
+import { type } from "@oh-my-pi/omptype";
 import imageExtension from "../.test-dist/extensions/index.js";
 import { ARTIFACT_ENTRY, RESERVATION_ENTRY, artifactRecord, readArtifactManifest, reserveArtifact } from "../.test-dist/src/artifacts.js";
 
@@ -62,6 +63,7 @@ async function fixture(t) {
   const commands = {};
   const sent = [];
   imageExtension({
+    arktype: type,
     registerProvider() {},
     registerTool(tool) { tools[tool.name] = tool; },
     registerCommand(name, command) { commands[name] = command; },
@@ -174,6 +176,7 @@ test("/image-artifacts lists and recent edits recover originals by branch", asyn
   // A second extension instance has no memory of the first run: recovery comes from the branch alone.
   const fresh = [];
   imageExtension({
+    arktype: type,
     registerProvider() {}, registerTool() {}, appendEntry() {}, sendMessage: message => fresh.push(message),
     registerCommand: (name, command) => { if (name === "image-artifacts") fresh.command = command; },
   });

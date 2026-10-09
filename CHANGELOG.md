@@ -14,6 +14,7 @@
 
 ### Fixed
 
+- Fix Git marketplace extension loading by using OMP's injected schema builder instead of importing `@oh-my-pi/omptype` at runtime; retain it only as a development dependency.
 - Preserve recoverable artifacts when persistent saves fail and report post-generation storage failures without retries.
 - Anchor recovery before generation so cancelled commits that finish after tree navigation or session replacement remain recoverable only from the originating branch and its forks.
 

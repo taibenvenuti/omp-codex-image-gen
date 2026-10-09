@@ -42,9 +42,6 @@
       "./index.ts"
     ]
   },
-  "dependencies": {
-    "@oh-my-pi/omptype": "^18.0.6"
-  },
   "peerDependencies": {
     "@oh-my-pi/pi-coding-agent": ">=18.0.5"
   },
@@ -54,6 +51,7 @@
     }
   },
   "devDependencies": {
+    "@oh-my-pi/omptype": "^18.0.6",
     "@oh-my-pi/pi-coding-agent": "^18.0.6",
     "@types/node": "^26.6.3",
     "tsx": "^4.22.4",

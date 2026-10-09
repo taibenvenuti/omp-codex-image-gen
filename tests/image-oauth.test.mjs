@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { createServer } from "node:http";
 import test from "node:test";
+import { type } from "@oh-my-pi/omptype";
 import extension from "../.test-dist/extensions/index.js";
 import { extractImageAccountId, IMAGE_AUTH_PROVIDER, imageAuthProvider, parseImageOAuthCallback } from "../.test-dist/src/image-oauth.js";
 
@@ -64,6 +65,7 @@ test("extension registers an auth-only OAuth provider with OMP's provider API", 
   const h = mockTokenFetch(t);
   const registered = [];
   extension({
+    arktype: type,
     registerProvider: (name, config) => registered.push({ name, config }),
     registerTool() {},
     registerCommand() {},

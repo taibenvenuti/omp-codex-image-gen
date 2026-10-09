@@ -13,7 +13,6 @@ import { constants } from "node:fs";
 import { mkdir, open, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
-import { type } from "@oh-my-pi/omptype";
 import type {
 	AgentToolResult,
 	AgentToolUpdateCallback,
@@ -92,27 +91,17 @@ export function abortableDelay(milliseconds: number, signal?: AbortSignal): Prom
 	});
 }
 
-// --- Tool parameter schema ---
+// --- Tool parameters ---
 
-const TOOL_PARAMS = type({
-	prompt: type("string").atLeastLength(1).atMostLength(MAX_PROMPT_CHARS).describe(
-		"The image prompt. Be specific about subject, composition, style, text, and constraints.",
-	),
-	"model?": type("string").atLeastLength(1).atMostLength(200).describe(`Codex routing model, not an image model selector. Defaults to ${DEFAULT_MODEL}.`),
-	"outputFormat?": type("'png' | 'jpeg' | 'webp'"),
-	"save?": type("'none' | 'project' | 'global' | 'custom'"),
-	"saveDir?": type("string").describe(
-		"Directory to save the image when save=custom. Relative paths resolve under the current workspace.",
-	),
-	"referencedImagePaths?": type("string[]")
-		.atMostLength(MAX_EDIT_IMAGES)
-		.describe("Up to five local image paths to edit. Relative paths resolve under the current workspace."),
-	"numLastImagesToInclude?": type("number.integer").describe(
-		"Use the most recent one to five images from the current conversation as edit inputs.",
-	),
-});
-
-type ToolParams = typeof TOOL_PARAMS.infer;
+interface ToolParams {
+	prompt: string;
+	model?: string;
+	outputFormat?: OutputFormat;
+	save?: SaveMode;
+	saveDir?: string;
+	referencedImagePaths?: string[];
+	numLastImagesToInclude?: number;
+}
 
 // --- Config types ---
 
@@ -467,6 +456,24 @@ async function requestImage(
 // --- Extension entry point ---
 
 export default function codexImageGen(omp: ExtensionAPI) {
+	const type = omp.arktype;
+	const TOOL_PARAMS = type({
+		prompt: type("string").atLeastLength(1).atMostLength(MAX_PROMPT_CHARS).describe(
+			"The image prompt. Be specific about subject, composition, style, text, and constraints.",
+		),
+		"model?": type("string").atLeastLength(1).atMostLength(200).describe(`Codex routing model, not an image model selector. Defaults to ${DEFAULT_MODEL}.`),
+		"outputFormat?": type("'png' | 'jpeg' | 'webp'"),
+		"save?": type("'none' | 'project' | 'global' | 'custom'"),
+		"saveDir?": type("string").describe(
+			"Directory to save the image when save=custom. Relative paths resolve under the current workspace.",
+		),
+		"referencedImagePaths?": type("string[]")
+			.atMostLength(MAX_EDIT_IMAGES)
+			.describe("Up to five local image paths to edit. Relative paths resolve under the current workspace."),
+		"numLastImagesToInclude?": type("number.integer").describe(
+			"Use the most recent one to five images from the current conversation as edit inputs.",
+		),
+	});
 	omp.registerProvider(IMAGE_AUTH_PROVIDER, imageAuthProvider);
 
 	const guidelines = [

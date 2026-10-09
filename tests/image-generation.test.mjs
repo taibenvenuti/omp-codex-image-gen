@@ -3,6 +3,7 @@ import { mkdir, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { type } from "@oh-my-pi/omptype";
 import { IMAGE_AUTH_PROVIDER } from "../.test-dist/src/image-oauth.js";
 import { MAX_RESPONSE_BYTES, REQUEST_TIMEOUT_MS } from "../.test-dist/src/codex-response.js";
 
@@ -40,6 +41,7 @@ function sseResponse(image = PNG.toString("base64")) {
 function createTool(registerProvider = () => {}) {
   let tool;
   extension({
+    arktype: type,
     registerProvider,
     registerCommand() {},
     registerTool(value) { if (value.name === "codex_generate_image") tool = value; },
