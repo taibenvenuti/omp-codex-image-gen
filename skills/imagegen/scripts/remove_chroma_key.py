@@ -8,10 +8,14 @@ generate an image on a flat key color, then convert that key color to alpha.
 from __future__ import annotations
 
 import argparse
+import importlib
 from io import BytesIO
+import os
 from pathlib import Path
 import re
+import shutil
 from statistics import median
+import subprocess
 import sys
 from typing import Tuple
 
@@ -20,27 +24,124 @@ Color = Tuple[int, int, int]
 KEY_DOMINANCE_THRESHOLD = 16.0
 ALPHA_NOISE_FLOOR = 8
 
+PILLOW_CACHE_ENV = "OMP_IMAGEGEN_PYTHON_PACKAGES"
+PILLOW_CACHE_DIR = Path.home() / ".cache" / "omp" / "imagegen" / "pillow"
+
 
 def _die(message: str, code: int = 1) -> None:
     print(f"Error: {message}", file=sys.stderr)
     raise SystemExit(code)
 
 
+def _pillow_cache_dir() -> Path:
+    configured = os.environ.get(PILLOW_CACHE_ENV)
+    root = Path(configured).expanduser() if configured else PILLOW_CACHE_DIR
+    # Compiled wheels are ABI-specific; keep one namespace per interpreter ABI.
+    return root / f"{sys.implementation.cache_tag}{getattr(sys, 'abiflags', '')}"
+
+
+def _find_uv() -> str | None:
+    candidates = (
+        os.environ.get("OMP_UV"),
+        shutil.which("uv"),
+        str(Path.home() / ".local" / "bin" / "uv"),
+    )
+    for candidate in candidates:
+        if not candidate:
+            continue
+        executable = shutil.which(candidate)
+        if executable:
+            return executable
+    return None
+
+
+def _clear_pillow_modules() -> None:
+    for module_name in tuple(sys.modules):
+        if module_name == "PIL" or module_name.startswith("PIL."):
+            sys.modules.pop(module_name, None)
+
+
 def _dependency_hint(package: str) -> str:
     return (
-        "Activate the repo-selected environment first, then install it with "
-        f"`uv pip install {package}`. If this repo uses a local virtualenv, start with "
-        "`source .venv/bin/activate`; otherwise use this repo's configured shared fallback "
-        "environment."
+        "The helper normally bootstraps this dependency into its user cache with uv "
+        "(or python -m pip). If that bootstrap is unavailable, install it with "
+        f"`uv pip install {package}` in the active environment."
     )
+
+
+def _install_pillow(cache_dir: Path) -> None:
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    commands: list[list[str]] = []
+    uv = _find_uv()
+    if uv:
+        commands.append(
+            [
+                uv,
+                "pip",
+                "install",
+                "--target",
+                str(cache_dir),
+                "--python",
+                sys.executable,
+                "pillow",
+            ]
+        )
+    commands.append(
+        [sys.executable, "-m", "pip", "install", "--target", str(cache_dir), "pillow"]
+    )
+
+    print(f"Pillow not found; installing it into {cache_dir}.", file=sys.stderr)
+    failures: list[str] = []
+    for command in commands:
+        try:
+            result = subprocess.run(
+                command,
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+        except OSError as error:
+            failures.append(f"{command[0]}: {error}")
+            continue
+        if result.returncode == 0:
+            return
+        detail = (result.stderr or result.stdout).strip()
+        failures.append(f"{' '.join(command[:3])}: {detail or 'command failed'}")
+
+    _die(
+        "Pillow is required for chroma-key removal, and automatic installation failed.\n"
+        + "\n".join(failures)
+        + "\n"
+        + _dependency_hint("pillow")
+    )
+
+
+def _import_pillow():
+    from PIL import Image, ImageFilter
+    return Image, ImageFilter
 
 
 def _load_pillow():
     try:
-        from PIL import Image, ImageFilter
+        return _import_pillow()
     except ImportError:
-        _die(f"Pillow is required for chroma-key removal. {_dependency_hint('pillow')}")
-    return Image, ImageFilter
+        _clear_pillow_modules()
+
+    cache_dir = _pillow_cache_dir()
+    cache_path = str(cache_dir)
+    if cache_path not in sys.path:
+        sys.path.insert(0, cache_path)
+    importlib.invalidate_caches()
+    try:
+        return _import_pillow()
+    except ImportError:
+        _clear_pillow_modules()
+        _install_pillow(cache_dir)
+        importlib.invalidate_caches()
+        try:
+            return _import_pillow()
+        except ImportError as error:
+            _die(f"Pillow installation finished, but import still failed: {error}")
 
 
 def _parse_key_color(raw: str) -> Color:

@@ -36,7 +36,7 @@ Rules:
 - Do not automatically repeat quota, connection, timeout, or incomplete-stream failures. The remote generation may already have consumed quota.
 - Use `referencedImagePaths` for edits when every target has a local path. Use `numLastImagesToInclude` only when a target is available solely in recent conversation history. Never provide both selectors. Masks and advanced CLI-only controls still require confirmed CLI fallback.
 - Do not switch to CLI fallback for ordinary generation quality, size, or output file-path control.
-- If the user explicitly asks for a transparent image/background, stay on OMP `codex_generate_image` first: prompt for a flat removable chroma-key background, then remove it locally with the installed helper at `scripts/remove_chroma_key.py`.
+- If the user explicitly asks for a transparent image/background, stay on OMP `codex_generate_image` first: prompt for a flat removable chroma-key background, then remove it locally with the installed helper at `scripts/remove_chroma_key.py`, which bootstraps Pillow when needed.
 - Never silently switch from OMP `codex_generate_image` or CLI `gpt-image-2` to CLI `gpt-image-1.5`. Treat this as a model/path downgrade and ask the user before doing it, unless the user has already explicitly requested `gpt-image-1.5`, `scripts/image_gen.py`, or CLI fallback.
 - If a transparent request appears too complex for clean chroma-key removal, asks for true/native transparency, or local removal fails validation, offer CLI `gpt-image-2 --background transparent --output-format png` (native transparency preview). Run the CLI fallback only after the user confirms.
 - The word `batch` by itself does not mean CLI fallback. If the user asks for many assets or says to batch-generate assets without explicitly asking for CLI/API/model controls, stay on the OMP tool path and issue one OMP tool call per requested asset or variant.
@@ -65,7 +65,7 @@ Fallback-only docs/resources for CLI mode:
 - `scripts/image_gen.py`
 
 Local post-processing helper:
-- `scripts/remove_chroma_key.py`: removes a flat chroma-key background from a generated image and writes a PNG/WebP with alpha. Prefer auto-key sampling, soft matte, and despill for antialiased edges.
+- `scripts/remove_chroma_key.py`: removes a flat chroma-key background from a generated image and writes a PNG/WebP with alpha. It uses Pillow from the active environment when available; otherwise it lazily installs Pillow with `uv` (or `python -m pip` fallback) into a per-interpreter cache under `~/.cache/omp/imagegen/pillow/<interpreter-tag>/`. Prefer auto-key sampling, soft matte, and despill for antialiased edges.
 
 ## When to use
 - Generate a new image (concept art, product shot, cover, website hero)
@@ -121,7 +121,7 @@ Assume the user wants a new image unless they clearly ask to change an existing 
    - If the user's prompt is already specific and detailed, normalize it into a clear spec without adding creative requirements.
    - If the user's prompt is generic, add tasteful augmentation only when it materially improves output quality.
 10. Use the OMP `codex_generate_image` tool by default for generation and supported existing-image edits. Ask for CLI fallback confirmation only when the request requires unsupported controls such as masks.
-11. For transparent-output requests, follow the transparent image guidance below: generate with OMP `codex_generate_image` on a flat chroma-key background, copy the selected output into the workspace or `tmp/imagegen/`, run the installed `scripts/remove_chroma_key.py` helper, and validate the alpha result before using it. If this path looks unsuitable or fails, ask before switching to the API CLI.
+11. For transparent-output requests, follow the transparent image guidance below: generate with OMP `codex_generate_image` on a flat chroma-key background, copy the selected output into the workspace or `tmp/imagegen/`, run the installed `scripts/remove_chroma_key.py` helper (it bootstraps Pillow if needed), and validate the alpha result before using it. If this path looks unsuitable or fails, ask before switching to the API CLI.
 12. Inspect outputs and validate: subject, style, composition, text accuracy, and invariants/avoid items.
 13. Iterate with a single targeted change, then re-check.
 14. For preview-only work, render the image inline; the underlying file may remain at the default `<omp-agent-dir>/generated-images/<omp-session-id>/<image-call-id>.*` path.
@@ -149,6 +149,7 @@ Default sequence:
      --opaque-threshold 220 \
      --despill
    ```
+   The helper first uses Pillow from the active environment and installs it only when that import fails, into an interpreter-specific cache directory (named from the Python implementation and ABI, e.g. `cpython-313`) under `~/.cache/omp/imagegen/pillow`; set `OMP_IMAGEGEN_PYTHON_PACKAGES` to override the cache root.
 5. Validate that the output has an alpha channel, transparent corners, plausible subject coverage, and no obvious key-color fringe. If a thin fringe remains, retry once with `--edge-contract 1`; use `--edge-feather 0.25` only when the edge is visibly stair-stepped and the subject is not shiny or reflective.
 6. Save the final alpha PNG/WebP in the project if the asset is project-bound. Never leave a project-referenced transparent asset only under `<omp-agent-dir>/generated-images/<omp-session-id>/*`.
 
@@ -334,7 +335,11 @@ Required Python package:
 uv pip install openai
 ```
 
-Required for local chroma-key removal and optional downscaling:
+Local chroma-key removal and optional CLI downscaling need Pillow in the active
+environment. The bundled `remove_chroma_key.py` additionally bootstraps Pillow
+into an interpreter-specific cache under `~/.cache/omp/imagegen/pillow` with
+`uv` (or `python -m pip` fallback) when the import is missing. To provision it
+manually:
 ```bash
 uv pip install pillow
 ```
@@ -342,6 +347,7 @@ uv pip install pillow
 Portability note:
 - If you are using the installed skill outside this repo, install dependencies into that environment with its package manager.
 - In uv-managed environments, `uv pip install ...` remains the preferred path.
+- Set `OMP_IMAGEGEN_PYTHON_PACKAGES` to a writable cache root when the default user cache is unavailable.
 
 ### Environment
 - `OPENAI_API_KEY` must be set for live API calls.

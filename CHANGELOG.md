@@ -9,6 +9,7 @@
 ### Added
 
 - Add `codex_generate_image_artifact` for scripted and nested workflows, returning structured original-file metadata instead of base64 image payloads.
+- Add automatic Pillow bootstrap for the imagegen chroma-key helper, preferring the active environment and caching installs per interpreter.
 - Add branch-local artifact recovery, recent-artifact edits, and `/image-artifacts`; keep completed private temporary originals through script failures and reload.
 
 ### Fixed
