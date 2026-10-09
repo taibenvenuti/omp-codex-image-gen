@@ -1,7 +1,7 @@
 {
   "name": "omp-codex-image-gen",
   "version": "0.1.0",
-  "description": "Image generation for Oh My Pi using the ChatGPT Images 2.0 model.",
+  "description": "Image generation and editing for Oh My Pi using your ChatGPT Codex login.",
   "type": "module",
   "license": "Apache-2.0",
   "x-apache-notice": "Modified by Oh My Pi contributors from pi-codex-image-gen (Apache-2.0).",
@@ -55,7 +55,7 @@
   },
   "devDependencies": {
     "@oh-my-pi/pi-coding-agent": "^18.0.6",
-    "@types/node": "^26.2.0",
+    "@types/node": "^26.6.3",
     "tsx": "^4.22.4",
     "typescript": "^7.0.2"
   },

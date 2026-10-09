@@ -1,8 +1,10 @@
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, open, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
+import { IMAGE_AUTH_PROVIDER } from "../.test-dist/src/image-oauth.js";
+import { MAX_RESPONSE_BYTES, REQUEST_TIMEOUT_MS } from "../.test-dist/src/codex-response.js";
 
 import extension, {
   abortableDelay,
@@ -20,7 +22,7 @@ const WEBP = Buffer.concat([Buffer.from("RIFF"), Buffer.alloc(4), Buffer.from("W
 
 function jwt() {
   const payload = Buffer.from(JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: "account" } })).toString("base64url");
-  return `header.${payload}.signature`;
+  return `${Buffer.from('{"alg":"none"}').toString("base64url")}.${payload}.signature`;
 }
 
 function sseResponse(image = PNG.toString("base64")) {
@@ -35,13 +37,29 @@ function sseResponse(image = PNG.toString("base64")) {
   });
 }
 
-function createTool() {
+function createTool(registerProvider = () => {}) {
   let tool;
   extension({
-    registerTool(value) { tool = value; },
+    registerProvider,
+    registerCommand() {},
+    registerTool(value) { if (value.name === "codex_generate_image") tool = value; },
   });
   assert.ok(tool);
   return tool;
+}
+
+// OMP auth storage stub: undefined = no stored login, null = stored login whose
+// refresh fails (OMP resolves that to undefined), Error = refresh throws.
+function authStorage(byProvider, lookups = []) {
+  return {
+    listOAuthAccounts: provider => byProvider[provider] === undefined ? [] : [{}],
+    getOAuthAccess: async provider => {
+      lookups.push(provider);
+      const value = byProvider[provider];
+      if (value instanceof Error) throw value;
+      return value ? { accessToken: value } : undefined;
+    },
+  };
 }
 
 function context(cwd, messages = []) {
@@ -50,13 +68,22 @@ function context(cwd, messages = []) {
     isProjectTrusted: () => false,
     modelRegistry: {
       find: () => undefined,
-      getApiKeyForProvider: async () => jwt(),
+      authStorage: authStorage({ "openai-codex": jwt() }),
     },
     sessionManager: {
       getSessionId: () => "session-1",
       getBranch: () => messages.map((message) => ({ type: "message", message })),
     },
   };
+}
+
+function isolateAgentDir(t, cwd) {
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = join(cwd, "isolated-agent");
+  t.after(() => {
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+  });
 }
 
 test("strict image decoding accepts matching formats", () => {
@@ -141,6 +168,28 @@ test("tool edit request includes local image content", async (t) => {
   assert.equal(requestBody.input[0].content[1].type, "input_image");
 });
 
+test("tool defaults to GPT-6 Astra while leaving image model selection to Codex", async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), "imagegen-model-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  isolateAgentDir(t, cwd);
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  let body;
+  globalThis.fetch = async (_url, init) => {
+    body = JSON.parse(init.body);
+    return sseResponse();
+  };
+  const tool = createTool();
+  const updates = [];
+  const result = await tool.execute("call", { prompt: "test", save: "none" }, undefined,
+    (update) => updates.push(update), context(cwd));
+  assert.equal(body.model, "gpt-6-astra");
+  assert.equal(result.details.model, "gpt-6-astra");
+  assert.ok(updates.every(update => update.details.model === "gpt-6-astra"));
+  assert.deepEqual(body.tools, [{ type: "image_generation", output_format: "png" }]);
+  assert.equal(result.details.backendImageModel, "unknown");
+});
+
 test("retry loop honors Retry-After and remains bounded", async (t) => {
   const cwd = await mkdtemp(join(tmpdir(), "imagegen-retry-"));
   t.after(() => rm(cwd, { recursive: true, force: true }));
@@ -209,4 +258,407 @@ test("malformed backend payload fails before saving or returning image content",
   globalThis.fetch = async () => sseResponse("!!!!");
   await assert.rejects(createTool().execute("call", { prompt: "test", save: "custom", saveDir: "out" }, undefined, undefined, context(cwd)), /invalid base64/);
   await assert.rejects(readFile(join(cwd, "out", "session-1", "image-1.png")));
+});
+
+async function harness(t, responder, registerProvider) {
+  const cwd = await mkdtemp(join(tmpdir(), "imagegen-contract-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  const calls = [];
+  globalThis.fetch = async (url, init) => {
+    calls.push({ url, ...init });
+    return responder(url, init);
+  };
+  const tool = createTool(registerProvider);
+  return {
+    cwd, calls, tool,
+    run: (params = {}, signal, onUpdate, ctx = context(cwd)) =>
+      tool.execute("call", { prompt: "test", save: "none", ...params }, signal, onUpdate, ctx),
+  };
+}
+
+function imageEvent(extra = {}) {
+  return { type: "response.output_item.done", item: {
+    type: "image_generation_call", id: "image-1", status: "completed", result: PNG.toString("base64"), ...extra,
+  } };
+}
+
+function streamEvents(events, { crlf = false, fragment = false, close = true, cancel = () => {} } = {}) {
+  const newline = crlf ? "\r\n" : "\n";
+  const bytes = Buffer.from(events.map(event => `data: ${JSON.stringify(event)}${newline}${newline}`).join(""));
+  return new Response(new ReadableStream({
+    start(controller) {
+      if (fragment) for (let i = 0; i < bytes.length; i++) controller.enqueue(bytes.subarray(i, i + 1));
+      else controller.enqueue(bytes);
+      if (close) controller.close();
+    },
+    cancel,
+  }));
+}
+
+function keys(ctx, byProvider, lookups = []) {
+  ctx.modelRegistry.authStorage = authStorage(byProvider, lookups);
+  return ctx;
+}
+
+test("tool sends an honest OMP User-Agent, blocks redirects, and retains the subscription route", async (t) => {
+  const h = await harness(t, () => sseResponse());
+  const result = await h.run();
+  assert.equal(h.calls[0].url, "https://chatgpt.com/backend-api/codex/responses");
+  assert.equal(h.calls[0].headers["User-Agent"], "omp-codex-image-gen");
+  assert.equal(h.calls[0].headers.originator, "pi");
+  assert.equal(h.calls[0].headers["chatgpt-account-id"], "account");
+  assert.equal(h.calls[0].headers.Authorization, `Bearer ${jwt()}`);
+  assert.equal(result.details.provider, "openai-codex");
+  assert.equal(result.details.transport, "codex-responses");
+  assert.equal(h.calls[0].redirect, "error");
+  assert.ok(h.calls[0].signal instanceof AbortSignal);
+});
+
+test("owned image OAuth uses the Astra default and preserves config and per-call routing overrides", async (t) => {
+  const h = await harness(t, () => sseResponse());
+  isolateAgentDir(t, h.cwd);
+  const ctx = keys(context(h.cwd), { [IMAGE_AUTH_PROVIDER]: jwt() });
+  const defaultResult = await h.run({}, undefined, undefined, ctx);
+  await mkdir(join(h.cwd, ".omp", "extensions"), { recursive: true });
+  await writeFile(join(h.cwd, ".omp", "extensions", "codex-image-gen.json"),
+    JSON.stringify({ model: "gpt-6.1-sol" }));
+  ctx.isProjectTrusted = () => true;
+  const configuredResult = await h.run({}, undefined, undefined, ctx);
+  const explicitResult = await h.run({ model: "gpt-5.5" }, undefined, undefined, ctx);
+  assert.deepEqual(h.calls.map(call => JSON.parse(call.body).model),
+    ["gpt-6-astra", "gpt-6.1-sol", "gpt-5.5"]);
+  assert.deepEqual([defaultResult, configuredResult, explicitResult].map(result => result.details.model),
+    ["gpt-6-astra", "gpt-6.1-sol", "gpt-5.5"]);
+  assert.ok([defaultResult, configuredResult, explicitResult].every(result =>
+    result.details.provider === IMAGE_AUTH_PROVIDER && result.details.backendImageModel === "unknown"));
+});
+
+test("registered image provider refreshes OAuth credentials and the access token generates", async (t) => {
+  const token = jwt();
+  let refreshes = 0;
+  let registered;
+  const h = await harness(t, (url, init) => {
+    if (url === "https://auth.openai.com/oauth/token") {
+      refreshes++;
+      assert.equal(init.body.get("grant_type"), "refresh_token");
+      assert.equal(init.body.get("refresh_token"), "test-only-refresh");
+      assert.equal(init.redirect, "error");
+      return Response.json({ access_token: token, refresh_token: "rotated-test-refresh", expires_in: 3600 });
+    }
+    return sseResponse();
+  }, (name, config) => { registered = { name, config }; });
+  assert.equal(registered.name, IMAGE_AUTH_PROVIDER);
+  assert.equal(registered.config.models, undefined);
+  const { oauth } = registered.config;
+  const credentials = await oauth.refreshToken({ access: "expired-test-token", refresh: "test-only-refresh", expires: 0 });
+  assert.equal(credentials.refresh, "rotated-test-refresh");
+  assert.equal(oauth.getApiKey(credentials), token);
+  const ctx = keys(context(h.cwd), { [IMAGE_AUTH_PROVIDER]: oauth.getApiKey(credentials) });
+  const updates = [];
+  const result = await h.run({ model: "gpt-5.5" }, undefined, update => updates.push(update), ctx);
+  assert.equal(refreshes, 1);
+  assert.equal(h.calls.length, 2);
+  const request = h.calls[1];
+  assert.equal(request.url, "https://chatgpt.com/backend-api/codex/responses");
+  assert.equal(request.headers.Authorization, `Bearer ${token}`);
+  assert.equal(request.headers["chatgpt-account-id"], "account");
+  assert.equal(request.headers["User-Agent"], "omp-codex-image-gen");
+  assert.equal(request.redirect, "error");
+  assert.ok(request.signal instanceof AbortSignal);
+  const body = JSON.parse(request.body);
+  assert.equal(body.model, "gpt-5.5");
+  assert.deepEqual(body.tools, [{ type: "image_generation", output_format: "png" }]);
+  assert.equal(result.details.provider, IMAGE_AUTH_PROVIDER);
+  assert.ok(updates.every(update => update.details.provider === IMAGE_AUTH_PROVIDER));
+  assert.doesNotMatch(JSON.stringify([updates, result]), /test-only|expired-test/);
+});
+
+test("tool prefers package-owned OAuth when both image logins exist", async (t) => {
+  const h = await harness(t, () => sseResponse());
+  const lookups = [];
+  const ctx = keys(context(h.cwd), { [IMAGE_AUTH_PROVIDER]: jwt(), "openai-codex": jwt() }, lookups);
+  const result = await h.run({}, undefined, undefined, ctx);
+  assert.equal(result.details.provider, IMAGE_AUTH_PROVIDER);
+  assert.deepEqual(lookups, [IMAGE_AUTH_PROVIDER]);
+});
+
+test("tool falls back to the openai-codex login only when package-owned credentials are absent", async (t) => {
+  const h = await harness(t, () => sseResponse());
+  const lookups = [];
+  const ctx = keys(context(h.cwd), { "openai-codex": jwt() }, lookups);
+  const result = await h.run({}, undefined, undefined, ctx);
+  assert.deepEqual(lookups, ["openai-codex"]);
+  assert.equal(result.details.provider, "openai-codex");
+  assert.equal(h.calls[0].url, "https://chatgpt.com/backend-api/codex/responses");
+  assert.equal(h.calls[0].headers.Authorization, `Bearer ${jwt()}`);
+});
+
+test("a stored image login that cannot refresh never falls back to another account", async t => {
+  const h = await harness(t, () => assert.fail("No image request is allowed"));
+  const lookups = [];
+  const ctx = keys(context(h.cwd), { [IMAGE_AUTH_PROVIDER]: null, "openai-codex": jwt() }, lookups);
+  await assert.rejects(h.run({}, undefined, undefined, ctx), /No alternate account was used/);
+  assert.deepEqual(lookups, [IMAGE_AUTH_PROVIDER]);
+});
+
+test("tool rejects missing auth and non-JWT API keys before a request", async (t) => {
+  for (const [name, byProvider] of [["missing", {}], ["api key", { "openai-codex": "test-only-paid-key" }]]) {
+    await t.test(name, async t => {
+      const h = await harness(t, () => assert.fail("No image request is allowed"));
+      const ctx = keys(context(h.cwd), byProvider);
+      await assert.rejects(h.run({}, undefined, undefined, ctx), error =>
+        /login codex-images/.test(error.message) && !error.message.includes("test-only-paid-key"));
+      assert.equal(h.calls.length, 0);
+    });
+  }
+});
+
+test("tool edits and saves images through package-owned OAuth", async (t) => {
+  const h = await harness(t, () => sseResponse());
+  await writeFile(join(h.cwd, "source.png"), PNG);
+  const ctx = keys(context(h.cwd), { [IMAGE_AUTH_PROVIDER]: jwt() });
+  const result = await h.run({
+    referencedImagePaths: ["source.png"], save: "custom", saveDir: "out",
+  }, undefined, undefined, ctx);
+  assert.equal(h.calls[0].url, "https://chatgpt.com/backend-api/codex/responses");
+  assert.equal(JSON.parse(h.calls[0].body).input[0].content[1].image_url, `data:image/png;base64,${PNG.toString("base64")}`);
+  assert.equal(result.details.inputImageCount, 1);
+  assert.equal(result.details.transport, "codex-responses");
+  assert.deepEqual(await readFile(result.details.savedPath), PNG);
+});
+
+test("legacy JWT payloads that are not objects fail with a safe login error", async (t) => {
+  for (const payload of [null, [], "PRIVATE_PAYLOAD"]) {
+    await t.test(JSON.stringify(payload), async t => {
+      const h = await harness(t, () => assert.fail("Invalid legacy auth must not be sent"));
+      const token = `header.${Buffer.from(JSON.stringify(payload)).toString("base64url")}.signature`;
+      const ctx = keys(context(h.cwd), { "openai-codex": token });
+      await assert.rejects(h.run({}, undefined, undefined, ctx), error =>
+        /login codex-images/.test(error.message) && !error.message.includes(token));
+      assert.equal(h.calls.length, 0);
+    });
+  }
+});
+
+test("tool sanitizes image OAuth refresh errors and does not fall back to another account", async (t) => {
+  const h = await harness(t, () => assert.fail("No image request is allowed"));
+  const lookups = [];
+  const ctx = keys(context(h.cwd), {
+    [IMAGE_AUTH_PROVIDER]: new Error("PRIVATE_TOKEN_RESPONSE"), "openai-codex": jwt(),
+  }, lookups);
+  await assert.rejects(h.run({}, undefined, undefined, ctx), error =>
+    /login codex-images/.test(error.message) && !error.message.includes("PRIVATE_TOKEN_RESPONSE"));
+  assert.equal(h.calls.length, 0);
+  assert.deepEqual(lookups, [IMAGE_AUTH_PROVIDER]);
+});
+
+test("image OAuth failure does not retry with legacy auth and redacts tokens", async (t) => {
+  const token = jwt();
+  const h = await harness(t, () => streamEvents([
+    { type: "response.output_text.delta", delta: token },
+    { type: "response.completed", response: {} },
+  ]));
+  const lookups = [];
+  const ctx = keys(context(h.cwd), { [IMAGE_AUTH_PROVIDER]: token, "openai-codex": jwt() }, lookups);
+  await assert.rejects(h.run({}, undefined, undefined, ctx), error =>
+    /did not return an image/.test(error.message) && !error.message.includes(token));
+  assert.equal(h.calls.length, 1);
+  assert.deepEqual(lookups, [IMAGE_AUTH_PROVIDER]);
+});
+
+test("tool handles fragmented CRLF events and reports backend metadata and progress", async (t) => {
+  let cancelled = false;
+  const h = await harness(t, () => streamEvents([
+    { type: "response.image_generation_call.in_progress" },
+    { type: "response.image_generation_call.generating" },
+    imageEvent({ size: "1254x1254", quality: "low", background: "opaque", output_format: "png" }),
+    { type: "response.completed", response: { usage: {
+      total_tokens: 10, input_tokens_details: { cached_tokens: 4 }, private_data: "DO_NOT_COPY",
+    } } },
+  ], { crlf: true, fragment: true, close: false, cancel: () => { cancelled = true; } }));
+  const updates = [];
+  const result = await h.run({}, undefined, update => updates.push(update));
+  assert.deepEqual(result.details.reportedImage, {
+    size: "1254x1254", quality: "low", background: "opaque", outputFormat: "png",
+  });
+  assert.equal(result.details.backendImageModel, "unknown");
+  assert.equal(result.details.byteCount, PNG.length);
+  assert.match(result.content[0].text, /Backend-reported size: 1254x1254/);
+  assert.ok(updates.some(update => update.details?.stage === "generating"));
+  assert.deepEqual(result.details.usage, { total_tokens: 10, input_tokens_details: { cached_tokens: 4 } });
+  assert.equal(cancelled, true);
+});
+
+test("tool accepts completion-only image output and only records a model when explicitly reported", async (t) => {
+  const h = await harness(t, () => streamEvents([
+    { type: "response.completed", response: { output: [
+      imageEvent({ model: "gpt-image-2.5-flare", background: "transparent" }).item,
+    ] } },
+  ]));
+  const result = await h.run();
+  assert.equal(result.details.backendImageModel, "gpt-image-2.5-flare");
+  assert.equal(result.details.reportedImage.background, "transparent");
+});
+
+test("tool rejects incomplete, failed, malformed, and multiple-image streams without retrying", async (t) => {
+  for (const events of [
+    [imageEvent()],
+    [imageEvent(), { type: "response.incomplete" }],
+    [imageEvent({ status: "failed" }), { type: "response.completed" }],
+    [imageEvent(), imageEvent({ id: "image-2" }), { type: "response.completed" }],
+    [{ type: "error", message: jwt() }],
+  ]) {
+    await t.test(JSON.stringify(events.map(event => event.type)), async (t) => {
+      const h = await harness(t, () => streamEvents(events));
+      await assert.rejects(h.run(), error => !error.message.includes(jwt()));
+      assert.equal(h.calls.length, 1);
+    });
+  }
+  const h = await harness(t, () => new Response(`data: invalid-${jwt()}\n\n`));
+  await assert.rejects(h.run(), error => /invalid stream event/.test(error.message) && !error.message.includes(jwt()));
+  assert.equal(h.calls.length, 1);
+});
+
+test("tool classifies Cloudflare, auth, quota, and moderation failures without exposing response bodies", async (t) => {
+  for (const [status, error, headers, message] of [
+    [403, "PRIVATE_HTML", { "cf-mitigated": "challenge" }, /Cloudflare/],
+    [401, "PRIVATE_AUTH", {}, /login/],
+    [429, { error: { code: "insufficient_quota", message: jwt() } }, {}, /quota/],
+    [429, { error: { type: "usage_limit_reached", message: jwt() } }, {}, /quota/],
+    [429, { error: { type: "image_generation_user_error", message: jwt() } }, {}, /Review the prompt/],
+  ]) {
+    await t.test(String(status) + String(message), async (t) => {
+      const h = await harness(t, () => new Response(JSON.stringify(error), { status, headers }));
+      await assert.rejects(h.run(), failure =>
+        message.test(failure.message) && !failure.message.includes(jwt()) && !failure.message.includes("PRIVATE_"));
+      assert.equal(h.calls.length, 1);
+    });
+  }
+});
+
+test("tool bounds error bodies and never echoes network exceptions", async (t) => {
+  let cancelled = false;
+  const h = await harness(t, () => new Response(new ReadableStream({
+    start(controller) { controller.enqueue(Buffer.from("PRIVATE_BODY".repeat(2000))); },
+    cancel() { cancelled = true; },
+  }), { status: 401 }));
+  await assert.rejects(h.run(), error => /401/.test(error.message) && !error.message.includes("PRIVATE_BODY"));
+  assert.equal(cancelled, true);
+  globalThis.fetch = async () => { throw new Error(jwt()); };
+  await assert.rejects(h.run(), error => /connection failed/.test(error.message) && !error.message.includes(jwt()));
+});
+
+test("tool rejects oversized streams from both declared length and streamed byte count", async (t) => {
+  const h = await harness(t, () => new Response("", { headers: { "content-length": String(MAX_RESPONSE_BYTES + 1) } }));
+  await assert.rejects(h.run(), /size limit/);
+  let cancelled = false;
+  const block = Buffer.from(":" + "x".repeat(1024 * 1024) + "\n\n");
+  globalThis.fetch = async () => new Response(new ReadableStream({
+    pull(controller) { controller.enqueue(block); },
+    cancel() { cancelled = true; },
+  }));
+  await assert.rejects(h.run(), /size limit/);
+  assert.equal(cancelled, true);
+});
+
+test("tool deadline aborts both a pending connection and a stalled stream", async (t) => {
+  for (const stalledStream of [false, true]) {
+    await t.test(stalledStream ? "stream" : "connection", async (t) => {
+      const h = await harness(t, () => stalledStream
+        ? new Response(new ReadableStream({ start() {} }))
+        : new Promise(() => {}));
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      const rejected = assert.rejects(h.run(), /timed out after 5 minutes/);
+      await new Promise(setImmediate);
+      t.mock.timers.tick(REQUEST_TIMEOUT_MS);
+      await rejected;
+      assert.equal(h.calls.length, 1);
+      assert.equal(h.calls[0].signal.aborted, true);
+    });
+  }
+});
+
+test("tool cancellation interrupts a stalled stream without another generation", async (t) => {
+  let cancelled = false;
+  const h = await harness(t, () => new Response(new ReadableStream({
+    start() {},
+    cancel() { cancelled = true; },
+  })));
+  const controller = new AbortController();
+  const rejected = assert.rejects(h.run({}, controller.signal), /aborted/);
+  await new Promise(setImmediate);
+  controller.abort();
+  await rejected;
+  assert.equal(cancelled, true);
+  assert.equal(h.calls.length, 1);
+});
+
+test("tool withholds stream exceptions and does not retry an interrupted response", async (t) => {
+  const h = await harness(t, () => new Response(new ReadableStream({
+    start(controller) { controller.error(new Error(jwt())); },
+  })));
+  await assert.rejects(h.run(), error => /stream was interrupted/.test(error.message) && !error.message.includes(jwt()));
+  assert.equal(h.calls.length, 1);
+});
+
+test("tool validates save settings, routing model, prompts, and input files before generating", async (t) => {
+  const h = await harness(t, () => { throw new Error("Must not call backend"); });
+  await assert.rejects(h.run({ save: "custom", saveDir: "" }), /save=custom/);
+  await assert.rejects(h.run({ model: "gpt-image-2.5-flare" }), /routing model/);
+  await assert.rejects(h.run({ prompt: "x".repeat(32001) }), /32,000/);
+  const large = join(h.cwd, "large.png");
+  const file = await open(large, "w");
+  await file.truncate(20 * 1024 * 1024 + 1);
+  await file.close();
+  await assert.rejects(h.run({ referencedImagePaths: [large] }), /20 MiB/);
+  await assert.rejects(h.run({ referencedImagePaths: [h.cwd] }), /regular files/);
+  await assert.rejects(h.run({ numLastImagesToInclude: 1 }, undefined, undefined,
+    context(h.cwd, [{ content: [{ type: "image", mimeType: "image/png", data: "!!!!" }] }])), /invalid base64/);
+  assert.equal(h.calls.length, 0);
+});
+
+test("tool redacts credentials from revised prompts and split response text", async (t) => {
+  const h = await harness(t, () => streamEvents([
+    imageEvent({ revised_prompt: `Prompt ${jwt()}`, id: jwt() }),
+    { type: "response.completed" },
+  ]));
+  assert.doesNotMatch(JSON.stringify(await h.run()), new RegExp(jwt().replaceAll(".", "\\.")));
+  globalThis.fetch = async () => streamEvents([
+    { type: "response.output_text.delta", delta: jwt().slice(0, 20) },
+    { type: "response.output_text.delta", delta: jwt().slice(20) },
+    { type: "response.completed" },
+  ]);
+  await assert.rejects(h.run(), error => !error.message.includes(jwt()));
+  globalThis.fetch = async () => streamEvents([
+    { type: "response.output_text.delta", delta: "x".repeat(3980) + " " + jwt() },
+    { type: "response.completed" },
+  ]);
+  await assert.rejects(h.run(), error => !error.message.includes(jwt().slice(0, 15)));
+});
+
+test("tool enforces decoded reference and output image limits", async (t) => {
+  const h = await harness(t, () => { throw new Error("Must not generate"); });
+  // This count shares the same base64 length as the maximum accepted input,
+  // so a pre-decode length check alone is not sufficient.
+  const input = Buffer.concat([PNG, Buffer.alloc(20 * 1024 * 1024 + 1 - PNG.length)]);
+  await assert.rejects(h.run({ numLastImagesToInclude: 1 }, undefined, undefined,
+    context(h.cwd, [{ content: [{ type: "image", mimeType: "image/png", data: input.toString("base64") }] }])), /20 MiB/);
+  assert.equal(h.calls.length, 0);
+  globalThis.fetch = async () => streamEvents([
+    imageEvent({ result: "A".repeat(Math.ceil(32 * 1024 * 1024 / 3) * 4 + 4) }),
+    { type: "response.completed" },
+  ]);
+  await assert.rejects(h.run(), /32 MiB/);
+});
+
+test("tool preserves an existing image on a repeated backend image ID", async (t) => {
+  const h = await harness(t, () => sseResponse());
+  const first = await h.run({ save: "custom", saveDir: "out" });
+  await writeFile(first.details.savedPath, "USER_IMAGE");
+  const second = await h.run({ save: "custom", saveDir: "out" });
+  assert.match(second.details.saveWarning, /could not be saved/);
+  assert.equal(await readFile(first.details.savedPath, "utf8"), "USER_IMAGE");
+  assert.equal(second.content[1].type, "image");
 });

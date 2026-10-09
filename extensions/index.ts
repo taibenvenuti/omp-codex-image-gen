@@ -2,28 +2,41 @@
 /**
  * Project-local Codex image generation extension.
  *
- * Registers `codex_generate_image`, a tool that uses OMP's existing
- * openai-codex ChatGPT/Codex auth to call the Codex Responses backend with the
- * native `image_generation` tool. The backend maps that tool to gpt-image-2.
+ * Registers inline and artifact image tools that use package-owned ChatGPT
+ * image OAuth (or OMP's existing openai-codex login) to call the Codex
+ * Responses backend with the native `image_generation` tool. The backend
+ * selects the image model.
  */
 
 import { readFileSync } from "node:fs";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { mkdir, open, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { type } from "@oh-my-pi/omptype";
-import type { ExtensionAPI } from "@oh-my-pi/pi-coding-agent";
+import type {
+	AgentToolResult,
+	AgentToolUpdateCallback,
+	ExtensionAPI,
+	ExtensionContext,
+} from "@oh-my-pi/pi-coding-agent";
+import { extractImageAccountId, imageAuthProvider, IMAGE_AUTH_PROVIDER } from "../src/image-oauth.js";
+import { abortable, httpFailure, MAX_IMAGE_BYTES, parseCodexSse, withRequestDeadline, type ParsedCodexResponse } from "../src/codex-response.js";
+import { ARTIFACT_ENTRY, RESERVATION_ENTRY, artifactRecord, artifactReservation, readArtifactManifest, branchArtifacts, reserveArtifact, type ImageArtifact, type ImageReservation } from "../src/artifacts.js";
 
-const PROVIDER = "openai-codex";
-const DEFAULT_MODEL = "gpt-5.5";
+const PACKAGE_NAME = "omp-codex-image-gen";
+const LEGACY_PROVIDER = "openai-codex";
+const DEFAULT_MODEL = "gpt-6-astra";
 const CODEX_RESPONSES_URL = "https://chatgpt.com/backend-api/codex/responses";
-const JWT_CLAIM_PATH = "https://api.openai.com/auth";
 const DEFAULT_SAVE_MODE = "global";
 const OPENAI_BETA_HEADER = "responses=experimental";
 const MAX_RETRIES = 3;
 const BASE_DELAY_MS = 1000;
 const MAX_RETRY_DELAY_MS = 30_000;
 const MAX_EDIT_IMAGES = 5;
+const MAX_INPUT_IMAGE_BYTES = 20 * 1024 * 1024;
+const MAX_TOTAL_INPUT_BYTES = 50 * 1024 * 1024;
+const MAX_PROMPT_CHARS = 32_000;
 
 const SAVE_MODES = ["none", "project", "global", "custom"] as const;
 type SaveMode = (typeof SAVE_MODES)[number];
@@ -32,11 +45,6 @@ const OUTPUT_FORMATS = ["png", "jpeg", "webp"] as const;
 type OutputFormat = (typeof OUTPUT_FORMATS)[number];
 
 // --- #1: Retry helpers with exponential backoff + jitter ---
-
-function isRetryableStatus(status: number, errorText: string): boolean {
-	if ([429, 500, 502, 503, 504].includes(status)) return true;
-	return /rate.?limit|overloaded|service.?unavailable|upstream.?connect|connection.?refused/i.test(errorText);
-}
 
 export function parseRetryAfter(value: string | null, nowMs = Date.now()): number | undefined {
 	if (!value) return undefined;
@@ -87,10 +95,10 @@ export function abortableDelay(milliseconds: number, signal?: AbortSignal): Prom
 // --- Tool parameter schema ---
 
 const TOOL_PARAMS = type({
-	prompt: type("string").describe(
+	prompt: type("string").atLeastLength(1).atMostLength(MAX_PROMPT_CHARS).describe(
 		"The image prompt. Be specific about subject, composition, style, text, and constraints.",
 	),
-	"model?": type("string").describe(`Codex model that should invoke image generation. Defaults to ${DEFAULT_MODEL}.`),
+	"model?": type("string").atLeastLength(1).atMostLength(200).describe(`Codex routing model, not an image model selector. Defaults to ${DEFAULT_MODEL}.`),
 	"outputFormat?": type("'png' | 'jpeg' | 'webp'"),
 	"save?": type("'none' | 'project' | 'global' | 'custom'"),
 	"saveDir?": type("string").describe(
@@ -119,20 +127,6 @@ interface SaveConfig {
 	outputDir?: string;
 }
 
-interface GeneratedImage {
-	id: string;
-	status: string;
-	result: string;
-	revisedPrompt?: string;
-}
-
-interface ParsedCodexResponse {
-	image?: GeneratedImage;
-	text: string[];
-	responseId?: string;
-	usage?: unknown;
-}
-
 interface InputImage {
 	data: string;
 	mimeType: string;
@@ -142,50 +136,32 @@ function getAgentDir(): string {
 	return resolve(process.env.PI_CODING_AGENT_DIR || join(homedir(), ".omp", "agent"));
 }
 
-// --- #11: Typed SSE event discriminated union ---
+// --- Image credentials (independent of the active chat provider) ---
 
-type CodexSseEvent =
-	| { type: "error"; message?: string; code?: string }
-	| { type: "response.failed"; response?: { error?: { message?: string } } }
-	| { type: "response.created"; response?: { id?: string } }
-	| { type: "response.output_text.delta"; delta?: string }
-	| {
-			type: "response.output_item.done";
-			item?: {
-				type?: string;
-				id?: string | number;
-				status?: string;
-				result?: string;
-				revised_prompt?: string;
-			};
-	  }
-	| { type: "response.completed"; response?: { id?: string; usage?: unknown } };
-
-// --- JWT helpers ---
-
-function decodeJwtPayload(token: string): Record<string, unknown> {
-	const parts = token.split(".");
-	if (parts.length !== 3 || !parts[1]) {
-		throw new Error("OpenAI Codex auth token is not a JWT. Run /login for openai-codex again.");
-	}
-	try {
-		return JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8")) as Record<string, unknown>;
-	} catch (error) {
-		throw new Error(`Failed to decode OpenAI Codex auth token: ${error instanceof Error ? error.message : String(error)}`);
-	}
+interface ImageAuth {
+	provider: typeof IMAGE_AUTH_PROVIDER | typeof LEGACY_PROVIDER;
+	token: string;
+	accountId: string;
 }
 
-function extractChatGptAccountId(token: string): string {
-	const payload = decodeJwtPayload(token);
-	const authClaims = payload[JWT_CLAIM_PATH];
-	if (!authClaims || typeof authClaims !== "object") {
-		throw new Error("OpenAI Codex auth token does not contain ChatGPT auth claims. Run /login for openai-codex again.");
+// Fallback is decided by stored-credential presence, not by whether a token
+// resolved: OMP's auth storage returns undefined for a failed refresh, which
+// must not silently switch to another account. getOAuthAccess also ignores
+// env and API-key credentials, so only OAuth logins are ever used.
+async function resolveImageAuth(registry: ExtensionContext["modelRegistry"], sessionId: string, signal?: AbortSignal): Promise<ImageAuth> {
+	const storage = registry.authStorage;
+	for (const provider of [IMAGE_AUTH_PROVIDER, LEGACY_PROVIDER] as const) {
+		if (storage.listOAuthAccounts(provider, sessionId).length === 0) continue;
+		let token: string | undefined;
+		try {
+			token = (await storage.getOAuthAccess(provider, sessionId, { signal }))?.accessToken;
+		} catch { /* reported below without exposing the cause */ }
+		if (!token) {
+			throw new Error(`Image authentication failed for ${provider}. Run /login ${IMAGE_AUTH_PROVIDER} again. No alternate account was used.`);
+		}
+		return { provider, token, accountId: extractImageAccountId(token) };
 	}
-	const accountId = (authClaims as Record<string, unknown>).chatgpt_account_id;
-	if (typeof accountId !== "string" || accountId.length === 0) {
-		throw new Error("OpenAI Codex auth token does not contain chatgpt_account_id. Run /login for openai-codex again.");
-	}
-	return accountId;
+	throw new Error(`Missing image OAuth credentials. Run /login ${IMAGE_AUTH_PROVIDER} (or /login openai-codex). API keys and Codex app credentials are not used.`);
 }
 
 // --- #10: try/catch readConfigFile replaces racy existsSync + readFileSync ---
@@ -214,7 +190,7 @@ export function resolveUnderCwd(cwd: string, path: string, homeDir = homedir()):
 }
 
 function sanitizePathPart(value: string, fallback: string): string {
-	const sanitized = value
+	const sanitized = value.slice(0, 128)
 		.split("")
 		.map((ch) => (/[a-zA-Z0-9_-]/.test(ch) ? ch : "_"))
 		.join("")
@@ -263,12 +239,13 @@ function imagePath(outputFormat: OutputFormat, outputDir: string, imageCallId: s
 }
 
 export function decodeImageData(base64Data: string, outputFormat: OutputFormat): Buffer {
+	if (base64Data.length > Math.ceil(MAX_IMAGE_BYTES / 3) * 4) throw new Error("Codex image exceeded the 32 MiB size limit.");
 	const value = base64Data.trim();
-	if (!value || value.length % 4 !== 0 || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) {
+	if (!value || value.length % 4 !== 0 || /[^A-Za-z0-9+/=]/.test(value)) {
 		throw new Error("Codex returned invalid base64 image data.");
 	}
 	const bytes = Buffer.from(value, "base64");
-	if (bytes.length === 0 || bytes.toString("base64") !== value) {
+	if (bytes.length === 0 || bytes.length > MAX_IMAGE_BYTES || bytes.toString("base64") !== value) {
 		throw new Error("Codex returned invalid base64 image data.");
 	}
 	const validSignature =
@@ -286,20 +263,24 @@ async function saveImage(
 	imageCallId: string,
 ): Promise<string> {
 	const filePath = imagePath(outputFormat, outputDir, imageCallId);
-	await mkdir(outputDir, { recursive: true });
-	await writeFile(filePath, bytes);
+	await mkdir(outputDir, { recursive: true, mode: 0o700 });
+	await writeFile(filePath, bytes, { flag: "wx", mode: 0o600 });
 	return filePath;
 }
 
-export function selectRecentImages(messages: unknown[], count: number): InputImage[] {
-	const images: InputImage[] = [];
+type RecentImage = InputImage | { path: string; mimeType: string };
+
+export function selectRecentImages(messages: unknown[], count: number): RecentImage[] {
+	const images: RecentImage[] = [];
 	for (let index = messages.length - 1; index >= 0 && images.length < count; index--) {
 		const message = messages[index] as { content?: unknown };
 		if (!Array.isArray(message?.content)) continue;
 		for (let contentIndex = message.content.length - 1; contentIndex >= 0 && images.length < count; contentIndex--) {
-			const block = message.content[contentIndex] as { type?: unknown; data?: unknown; mimeType?: unknown };
+			const block = message.content[contentIndex] as { type?: unknown; data?: unknown; mimeType?: unknown; path?: unknown };
 			if (block?.type === "image" && typeof block.data === "string" && typeof block.mimeType === "string") {
 				images.push({ data: block.data, mimeType: block.mimeType });
+			} else if (block?.type === "image_artifact" && typeof block.path === "string" && typeof block.mimeType === "string") {
+				images.push({ path: block.path, mimeType: block.mimeType });
 			}
 		}
 	}
@@ -311,6 +292,29 @@ function mimeFromBytes(bytes: Buffer, path: string): string {
 	if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) return "image/jpeg";
 	if (bytes.length >= 12 && bytes.toString("ascii", 0, 4) === "RIFF" && bytes.toString("ascii", 8, 12) === "WEBP") return "image/webp";
 	throw new Error(`Referenced image is unavailable or unsupported: ${path}`);
+}
+
+async function readInputImage(path: string): Promise<Buffer> {
+	// O_NONBLOCK prevents named pipes from blocking before the regular-file check.
+	const file = await open(path, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
+	try {
+		const info = await file.stat();
+		if (!info.isFile()) throw new Error("Referenced images must be regular files.");
+		if (info.size > MAX_INPUT_IMAGE_BYTES) throw new Error("Referenced image exceeds 20 MiB.");
+		const blocks: Buffer[] = [];
+		let total = 0;
+		while (true) {
+			const block = Buffer.alloc(Math.min(64 * 1024, MAX_INPUT_IMAGE_BYTES + 1 - total));
+			const { bytesRead } = await file.read(block, 0, block.length, null);
+			if (!bytesRead) break;
+			total += bytesRead;
+			if (total > MAX_INPUT_IMAGE_BYTES) throw new Error("Referenced image exceeds 20 MiB.");
+			blocks.push(block.subarray(0, bytesRead));
+		}
+		return Buffer.concat(blocks, total);
+	} finally {
+		await file.close();
+	}
 }
 
 export async function resolveInputImages(
@@ -325,27 +329,45 @@ export async function resolveInputImages(
 	}
 	if (paths.length > MAX_EDIT_IMAGES) throw new Error(`referencedImagePaths accepts at most ${MAX_EDIT_IMAGES} paths.`);
 	if (paths.length > 0) {
-		return Promise.all(
-			paths.map(async (path) => {
-				const normalized = path.startsWith("@") ? path.slice(1) : path;
-				const absolutePath = resolveUnderCwd(cwd, normalized);
-				let bytes: Buffer;
-				try {
-					bytes = await readFile(absolutePath);
-				} catch (error) {
-					throw new Error(`Unable to read referenced image at ${absolutePath}: ${error instanceof Error ? error.message : String(error)}`);
-				}
-				return { data: bytes.toString("base64"), mimeType: mimeFromBytes(bytes, absolutePath) };
-			}),
-		);
+		const images: InputImage[] = [];
+		let total = 0;
+		for (const path of paths) {
+			const normalized = path.startsWith("@") ? path.slice(1) : path;
+			const absolutePath = resolveUnderCwd(cwd, normalized);
+			let bytes: Buffer;
+			try {
+				bytes = await readInputImage(absolutePath);
+			} catch (error) {
+				throw new Error(`Unable to read referenced image at ${absolutePath}: ${error instanceof Error ? error.message : String(error)}`);
+			}
+			total += bytes.length;
+			if (total > MAX_TOTAL_INPUT_BYTES) throw new Error("Referenced images exceed 50 MiB in total.");
+			images.push({ data: bytes.toString("base64"), mimeType: mimeFromBytes(bytes, absolutePath) });
+		}
+		return images;
 	}
 	if (count !== undefined) {
 		if (!Number.isInteger(count) || count < 1 || count > MAX_EDIT_IMAGES) {
 			throw new Error(`numLastImagesToInclude must be between 1 and ${MAX_EDIT_IMAGES}.`);
 		}
-		const images = selectRecentImages(messages, count);
-		if (images.length !== count) {
-			throw new Error(`Requested the last ${count} conversation images, but only ${images.length} were available.`);
+		const recent = selectRecentImages(messages, count);
+		if (recent.length !== count) {
+			throw new Error(`Requested the last ${count} conversation images, but only ${recent.length} were available.`);
+		}
+		const images: InputImage[] = [];
+		let total = 0;
+		for (const selected of recent) {
+			const image = "path" in selected
+				? { data: (await readInputImage(selected.path)).toString("base64"), mimeType: selected.mimeType }
+				: selected;
+			if (image.data.length > Math.ceil(MAX_INPUT_IMAGE_BYTES / 3) * 4) throw new Error("Conversation image exceeds 20 MiB.");
+			const format = OUTPUT_FORMATS.find(format => mimeForFormat(format) === image.mimeType);
+			if (!format) throw new Error("Conversation image has an unsupported format.");
+			const bytes = decodeImageData(image.data, format);
+			if (bytes.length > MAX_INPUT_IMAGE_BYTES) throw new Error("Conversation image exceeds 20 MiB.");
+			total += bytes.length;
+			if (total > MAX_TOTAL_INPUT_BYTES) throw new Error("Conversation images exceed 50 MiB in total.");
+			images.push(image);
 		}
 		return images;
 	}
@@ -390,237 +412,250 @@ export function buildRequestBody(
 	};
 }
 
-// --- SSE parsing ---
-
-function parseSseDataLines(chunk: string): string | undefined {
-	const data = chunk
-		.split("\n")
-		.filter((line) => line.startsWith("data:"))
-		.map((line) => line.slice(5).trim())
-		.join("\n")
-		.trim();
-	return data && data !== "[DONE]" ? data : undefined;
-}
-
-async function parseCodexSse(response: Response, signal?: AbortSignal): Promise<ParsedCodexResponse> {
-	if (!response.body) throw new Error("Codex response did not include a stream body.");
-	const reader = response.body.getReader();
-	const decoder = new TextDecoder();
-	let buffer = "";
-	const parsed: ParsedCodexResponse = { text: [] };
-
-	try {
-		while (true) {
-			if (signal?.aborted) throw new Error("Image generation was aborted.");
-			const { done, value } = await reader.read();
-			if (done) break;
-			buffer += decoder.decode(value, { stream: true });
-
-			let separator = buffer.indexOf("\n\n");
-			while (separator !== -1) {
-				const chunk = buffer.slice(0, separator);
-				buffer = buffer.slice(separator + 2);
-				const data = parseSseDataLines(chunk);
-				if (data) handleCodexEvent(JSON.parse(data) as CodexSseEvent, parsed);
-				separator = buffer.indexOf("\n\n");
-			}
-		}
-		const remaining = parseSseDataLines(buffer);
-		if (remaining) handleCodexEvent(JSON.parse(remaining) as CodexSseEvent, parsed);
-	} finally {
-		try {
-			await reader.cancel();
-		} catch {
-			// ignored: stream may already be closed
-		}
-		reader.releaseLock();
-	}
-
-	return parsed;
-}
-
-// --- #11: Typed event handler via discriminated union ---
-
-function handleCodexEvent(event: CodexSseEvent, parsed: ParsedCodexResponse): void {
-	if (!event || typeof event !== "object") return;
-
-	switch (event.type) {
-		case "error": {
-			const e = event as Extract<CodexSseEvent, { type: "error" }>;
-			throw new Error(`Codex error: ${e.message || e.code || JSON.stringify(event)}`);
-		}
-		case "response.failed": {
-			const e = event as Extract<CodexSseEvent, { type: "response.failed" }>;
-			throw new Error(e.response?.error?.message || "Codex response failed.");
-		}
-		case "response.created": {
-			const e = event as Extract<CodexSseEvent, { type: "response.created" }>;
-			if (typeof e.response?.id === "string") {
-				parsed.responseId = e.response.id;
-			}
-			break;
-		}
-		case "response.output_text.delta": {
-			const e = event as Extract<CodexSseEvent, { type: "response.output_text.delta" }>;
-			if (typeof e.delta === "string") {
-				parsed.text.push(e.delta);
-			}
-			break;
-		}
-		case "response.output_item.done": {
-			const e = event as Extract<CodexSseEvent, { type: "response.output_item.done" }>;
-			const item = e.item;
-			if (item?.type === "image_generation_call") {
-				if (typeof item.result !== "string" || item.result.length === 0) {
-					throw new Error("Codex image_generation_call did not contain image data.");
-				}
-				parsed.image = {
-					id: String(item.id || "image_generation"),
-					status: String(item.status || "completed"),
-					result: item.result,
-					revisedPrompt: typeof item.revised_prompt === "string" ? item.revised_prompt : undefined,
-				};
-			}
-			break;
-		}
-		case "response.completed": {
-			const e = event as Extract<CodexSseEvent, { type: "response.completed" }>;
-			if (typeof e.response?.id === "string") parsed.responseId = e.response.id;
-			if (e.response?.usage) parsed.usage = e.response.usage;
-			break;
-		}
-	}
-}
-
 // --- #1: requestImage with retry + backoff + jitter ---
 
 async function requestImage(
 	params: ToolParams,
-	token: string,
-	accountId: string,
+	auth: ImageAuth,
 	model: string,
 	outputFormat: OutputFormat,
 	sessionId: string,
 	inputImages: InputImage[],
 	signal?: AbortSignal,
+	onProgress?: (stage: string) => void,
 ): Promise<ParsedCodexResponse> {
 	const body = JSON.stringify(buildRequestBody(params, model, outputFormat, sessionId, inputImages));
 	const headers: Record<string, string> = {
-		Authorization: `Bearer ${token}`,
-		"chatgpt-account-id": accountId,
+		Authorization: `Bearer ${auth.token}`,
+		"chatgpt-account-id": auth.accountId,
 		originator: "pi",
+		"User-Agent": PACKAGE_NAME,
 		"OpenAI-Beta": OPENAI_BETA_HEADER,
 		accept: "text/event-stream",
 		"content-type": "application/json",
 	};
 
-	for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt++) {
-		if (signal?.aborted) throw new Error("Image generation was aborted.");
-
-		const response = await fetch(CODEX_RESPONSES_URL, {
-			method: "POST",
-			headers,
-			body,
-			signal,
-		});
-
-		if (!response.ok) {
-			const errorText = await response.text();
-			if (attempt <= MAX_RETRIES && isRetryableStatus(response.status, errorText)) {
-				const delay = retryDelayMs(attempt, response.headers.get("retry-after"));
-				await abortableDelay(delay, signal);
-				continue;
+	return withRequestDeadline(signal, async (signal) => {
+		for (let attempt = 1; attempt <= MAX_RETRIES + 1; attempt++) {
+			signal.throwIfAborted();
+			let response: Response;
+			try {
+				response = await abortable(fetch(CODEX_RESPONSES_URL, {
+					method: "POST", headers, body, signal, redirect: "error",
+				}), signal);
+			} catch {
+				signal.throwIfAborted();
+				throw new Error("Codex connection failed. No automatic retry was made; check connectivity before trying again.");
 			}
-			throw new Error(`Codex image generation request failed (${response.status}): ${errorText}`);
+
+			if (!response.ok) {
+				const failure = await httpFailure(response, signal);
+				if (attempt <= MAX_RETRIES && failure.retry) {
+					const delay = retryDelayMs(attempt, response.headers.get("retry-after"));
+					await abortableDelay(delay, signal);
+					continue;
+				}
+				throw new Error(failure.message);
+			}
+
+			return parseCodexSse(response, signal, [auth.token, auth.accountId], onProgress);
 		}
-
-		return parseCodexSse(response, signal);
-	}
-
-	throw new Error("Codex image generation request failed after all retries.");
+		throw new Error("Codex image generation request failed after all retries.");
+	});
 }
 
 // --- Extension entry point ---
 
 export default function codexImageGen(omp: ExtensionAPI) {
-	omp.registerTool({
-		name: "codex_generate_image",
-		label: "Codex Image",
-		description:
-			"Generate or edit an image with the OpenAI Codex ChatGPT backend built-in image_generation tool (gpt-image-2). Accepts up to five local or recent conversation images. Uses the existing openai-codex login; does not require OPENAI_API_KEY.",
-		parameters: TOOL_PARAMS,
-		loadMode: "essential",
-		approval: "write",
-		async execute(toolCallId, params: ToolParams, signal, onUpdate, ctx) {
+	omp.registerProvider(IMAGE_AUTH_PROVIDER, imageAuthProvider);
+
+	const guidelines = [
+		"Generate or edit images only on a clear user request; each call consumes Codex image quota.",
+		"The model parameter selects a Codex routing model, not an image model. Do not pass gpt-image-* IDs.",
+		"Output metadata is backend-reported. Inspect pixels for dimensions and transparency; do not infer a served model.",
+		"Do not automatically repeat quota, connection, deadline, incomplete-stream, or artifact-storage failures. Quota may already have been consumed.",
+	].join(" ");
+
+	async function recordOriginal(
+		artifact: ImageArtifact, toolCallId: string, reservation: ImageReservation,
+		ctx: ExtensionContext, sessionId: string, originEntryId: string | null,
+	): Promise<string | undefined> {
+		const record = { artifact, toolCallId: toolCallId.slice(0, 256) };
+		let manifestPublished = false;
+		try {
+			await reservation.publish(record);
+			manifestPublished = true;
+		} catch { /* A completed original must survive a metadata-storage failure. */ }
+		// Do not attach late results to an unrelated branch or a replacement
+		// session. The pre-generation reservation and private manifest preserve
+		// recovery on the originating branch, including its forks and resumes.
+		try {
+			if (ctx.sessionManager.getSessionId() === sessionId && originEntryId
+				&& ctx.sessionManager.getBranch().some(entry => entry.id === originEntryId)) {
+				omp.appendEntry(ARTIFACT_ENTRY, record);
+				return undefined;
+			}
+		} catch { /* The context may be inactive after reload; use the manifest. */ }
+		if (manifestPublished) return undefined;
+		return `Artifact recovery metadata could not be persisted. Recover the image from ${artifact.path}. No generation retry was made.`;
+	}
+
+	async function executeImage(
+		artifactMode: boolean, toolCallId: string, params: ToolParams, signal: AbortSignal | undefined,
+		onUpdate: AgentToolUpdateCallback<unknown> | undefined, ctx: ExtensionContext,
+	): Promise<AgentToolResult<unknown>> {
+		let reservation: ImageReservation | undefined;
+		let originEntryId: string | null = null;
+		try {
+			if (typeof params.prompt !== "string" || !params.prompt.trim() || params.prompt.length > MAX_PROMPT_CHARS) {
+				throw new Error("Image prompt must contain 1 to 32,000 characters.");
+			}
 			const outputFormat = params.outputFormat || "png";
+			if (!OUTPUT_FORMATS.includes(outputFormat)) throw new Error("Unsupported image output format.");
 			const projectTrusted = typeof ctx.isProjectTrusted === "function" && ctx.isProjectTrusted();
 			const config = loadConfig(ctx.cwd, projectTrusted); // #5: load once, pass to resolveSaveConfig
 			const requestedModel = params.model || config.model || DEFAULT_MODEL;
-			const model = ctx.modelRegistry.find(PROVIDER, requestedModel)?.id || requestedModel; // #6: removed dead FALLBACK_MODEL
-			const sessionId = ctx.sessionManager.getSessionId();
-			const token = await ctx.modelRegistry.getApiKeyForProvider(PROVIDER, sessionId, { modelId: model, signal });
-			if (!token) {
-				throw new Error(`Missing ${PROVIDER} credentials. Run /login and select ChatGPT Plus/Pro (Codex).`);
+			if (typeof requestedModel !== "string" || !requestedModel.trim() || requestedModel.length > 200) {
+				throw new Error("Codex routing model must contain 1 to 200 characters.");
 			}
-			const accountId = extractChatGptAccountId(token);
+			if (requestedModel.startsWith("gpt-image-")) {
+				throw new Error("The model parameter selects a Codex routing model, not an image model. Subscription image-model selection is not verified.");
+			}
+			const sessionId = ctx.sessionManager.getSessionId();
+			const saveConfig = resolveSaveConfig(params, ctx.cwd, sessionId, config);
 			const messages: unknown[] = [];
-			for (const entry of ctx.sessionManager.getBranch()) {
+			const branch = ctx.sessionManager.getBranch();
+			const completedPaths = new Set(branch.flatMap(entry => {
+				const record = entry.type === "custom" && entry.customType === ARTIFACT_ENTRY ? artifactRecord(entry.data) : undefined;
+				return record ? [record.artifact.path] : [];
+			}));
+			for (const entry of params.numLastImagesToInclude !== undefined ? branch : []) {
 				if (entry.type === "message") messages.push(entry.message);
 				if (entry.type === "custom_message") messages.push(entry);
+				if (entry.type === "custom" && entry.customType === ARTIFACT_ENTRY) {
+					const record = artifactRecord(entry.data);
+					if (record) messages.push({ content: [{ type: "image_artifact", ...record.artifact }] });
+				}
+				if (entry.type === "custom" && entry.customType === RESERVATION_ENTRY) {
+					const pending = artifactReservation(entry.data);
+					const record = pending ? await readArtifactManifest(pending) : undefined;
+					// Normal completions also have a session entry. Prefer that
+					// later entry and avoid counting the same original twice.
+					if (record && !completedPaths.has(record.artifact.path)) {
+						messages.push({ content: [{ type: "image_artifact", ...record.artifact }] });
+					}
+				}
 			}
 			const inputImages = await resolveInputImages(params, ctx.cwd, messages);
+			signal?.throwIfAborted();
+			if (artifactMode) {
+				try {
+					reservation = await reserveArtifact(extensionForFormat(outputFormat));
+				} catch {
+					throw new Error("Image artifact storage is unavailable. No generation request was made.");
+				}
+				signal?.throwIfAborted();
+				// Attach the recovery anchor synchronously before quota/network
+				// work. A cancelled parent may settle while commit I/O is pending.
+				omp.appendEntry(RESERVATION_ENTRY, {
+					path: reservation.path, mimeType: mimeForFormat(outputFormat), toolCallId: toolCallId.slice(0, 256),
+				});
+				originEntryId = ctx.sessionManager.getLeafId();
+			}
+			const auth = await resolveImageAuth(ctx.modelRegistry, sessionId, signal);
+			const provider = auth.provider;
+			const model = ctx.modelRegistry.find(provider, requestedModel)?.id || requestedModel;
 
 			onUpdate?.({
-				content: [{ type: "text", text: `Requesting gpt-image-2 ${inputImages.length > 0 ? "edit" : "generation"} through ${PROVIDER}/${model}...` }],
-				details: { provider: PROVIDER, model, outputFormat, inputImageCount: inputImages.length },
+				content: [{ type: "text", text: `Requesting image ${inputImages.length > 0 ? "edit" : "generation"} through ${provider}/${model}...` }],
+				details: { provider, model, outputFormat, inputImageCount: inputImages.length },
 			});
 
-			const parsed = await requestImage(params, token, accountId, model, outputFormat, sessionId, inputImages, signal);
+			const started = Date.now();
+			const parsed = await requestImage(params, auth, model, outputFormat, sessionId, inputImages, signal, (stage) => {
+				onUpdate?.({
+					content: [{ type: "text", text: `Codex image stage: ${stage}.` }],
+					details: { provider, model, stage },
+				});
+			});
 			if (!parsed.image) {
 				const text = parsed.text.join("").trim();
 				throw new Error(text ? `Codex did not return an image. Response text: ${text}` : "Codex did not return an image.");
 			}
 
 			const imageBytes = decodeImageData(parsed.image.result, outputFormat);
-			const saveConfig = resolveSaveConfig(params, ctx.cwd, sessionId, config);
+			const reportedImage = parsed.image.reported;
 			let savedPath: string | undefined;
 			let attemptedPath: string | undefined;
 			let saveWarning: string | undefined;
+			let artifact: ImageArtifact | undefined;
+			let recoveryWarning: string | undefined;
+			if (reservation) {
+				try {
+					artifact = await reservation.commit(imageBytes, mimeForFormat(outputFormat));
+				} catch {
+					// Attempt the requested persistent copy below, never generation again.
+				}
+				// Persist before callbacks, persistent saves, or parent script output.
+				if (artifact) recoveryWarning = await recordOriginal(artifact, toolCallId, reservation, ctx, sessionId, originEntryId);
+			}
 			if (saveConfig.mode !== "none" && saveConfig.outputDir) {
 				attemptedPath = imagePath(outputFormat, saveConfig.outputDir, parsed.image.id || toolCallId);
 				try {
 					savedPath = await saveImage(imageBytes, outputFormat, saveConfig.outputDir, parsed.image.id || toolCallId);
-					onUpdate?.({
-						content: [{ type: "text", text: `Image saved to ${savedPath}.` }],
-						details: { provider: PROVIDER, model, savedPath, byteCount: imageBytes.length },
-					});
 				} catch (error) {
-					saveWarning = `Image generation succeeded, but the image could not be saved to disk: ${error instanceof Error ? error.message : String(error)}`;
+					const reason = (error instanceof Error ? error.message : String(error))
+						.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").slice(0, 500);
+					saveWarning = `Image generation succeeded, but the image could not be saved to disk: ${reason}`;
 				}
 			}
+			if (artifactMode && !artifact) {
+				if (savedPath) {
+					artifact = { path: savedPath, mimeType: mimeForFormat(outputFormat), byteCount: imageBytes.length };
+					recoveryWarning = await recordOriginal(artifact, toolCallId, reservation!, ctx, sessionId, originEntryId);
+					saveWarning = "Temporary artifact storage failed; recover the original from the persistent saved path. No generation retry was made.";
+				} else {
+					throw new Error("Image generation succeeded, but artifact storage failed and no usable file could be saved. Image quota may have been consumed. No automatic retry was made.");
+				}
+			}
+			saveWarning = [saveWarning, recoveryWarning].filter(Boolean).join(" ") || undefined;
 
 			const summary = [
-				`Generated image via ${PROVIDER}/${model} using backend gpt-image-2.`,
+				`Generated image via ${provider}/${model} using the backend-selected image model.`,
 				`Status: ${parsed.image.status}.`,
+				reportedImage.size ? `Backend-reported size: ${reportedImage.size}.` : undefined,
+				reportedImage.quality ? `Backend-reported quality: ${reportedImage.quality}.` : undefined,
+				reportedImage.background ? `Backend-reported background: ${reportedImage.background}.` : undefined,
 				parsed.image.revisedPrompt ? `Revised prompt: ${parsed.image.revisedPrompt}` : undefined,
-				savedPath ? `Saved image to: ${savedPath}` : "Image was not saved to disk.",
+				artifact ? `Original image artifact: ${artifact.path}.` : undefined,
+				savedPath ? `Saved image to: ${savedPath}` : artifactMode ? "No persistent image copy was saved." : "Image was not saved to disk.",
 				saveWarning ? `Warning: ${saveWarning}` : undefined,
 			]
 				.filter(Boolean)
 				.join(" ");
 
+			if (savedPath || artifact) onUpdate?.({
+				content: [{ type: "text", text: artifact ? `Original image artifact: ${artifact.path}.` : `Image saved to ${savedPath}.` }],
+				details: { provider, model, savedPath, artifact, byteCount: imageBytes.length },
+			});
+
 			return {
 				content: [
 					{ type: "text", text: summary },
-					{ type: "image", data: parsed.image.result, mimeType: mimeForFormat(outputFormat) },
+					...(!artifactMode ? [{ type: "image" as const, data: parsed.image.result, mimeType: mimeForFormat(outputFormat) }] : []),
 				],
 				details: {
-					provider: PROVIDER,
+					provider,
 					model,
-					backendImageModel: "gpt-image-2",
+					backendImageModel: reportedImage.model ?? "unknown",
+					reportedImage,
+					transport: "codex-responses",
+					generationDurationMs: Date.now() - started,
+					byteCount: imageBytes.length,
 					outputFormat,
 					saveMode: saveConfig.mode,
 					savedPath,
+					artifact,
 					attemptedPath,
 					saveWarning,
 					inputImageCount: inputImages.length,
@@ -630,6 +665,42 @@ export default function codexImageGen(omp: ExtensionAPI) {
 					usage: parsed.usage,
 				},
 			};
+		} finally {
+			// Cleanup only reservations made by this call, never completed originals.
+			await reservation?.dispose().catch(() => undefined);
+		}
+	}
+
+	const description = `Generate or edit an image with the OpenAI Codex ChatGPT backend built-in image_generation tool. The backend selects the image model. Accepts up to five local or recent conversation images (20 MiB each, 50 MiB total). Requires /login ${IMAGE_AUTH_PROVIDER} or an existing OMP openai-codex login; does not require an API key. Network deadline: 5 minutes; output image limit: 32 MiB; backend text is limited to 4,000 characters. ${guidelines}`;
+	omp.registerTool({
+		name: "codex_generate_image",
+		label: "Codex Image",
+		description: `${description} Returns an inline image.`,
+		parameters: TOOL_PARAMS,
+		loadMode: "essential",
+		approval: "write",
+		execute: (id, params: ToolParams, signal, update, ctx) => executeImage(false, id, params, signal, update, ctx),
+	});
+	omp.registerTool({
+		name: "codex_generate_image_artifact",
+		label: "Codex Image Artifact",
+		description: `${description} Returns metadata (details.artifact) and a private temporary original path, never image bytes. save=none disables persistent copies, not temporary storage. Completed artifacts survive errors and reload until user/OS cleanup. For chained edits pass the artifact path through referencedImagePaths; each edit consumes quota. Recover current-branch paths with /image-artifacts.`,
+		parameters: TOOL_PARAMS,
+		approval: "write",
+		execute: (id, params: ToolParams, signal, update, ctx) => executeImage(true, id, params, signal, update, ctx),
+	});
+	omp.registerCommand("image-artifacts", {
+		description: "List the last 20 generated original artifact paths on the current branch (no generation).",
+		handler: async (_args, ctx) => {
+			const records = (await branchArtifacts(ctx.sessionManager.getBranch())).slice(-20);
+			omp.sendMessage({
+				customType: "codex-image-artifact-list",
+				content: records.length ? records.map(record =>
+					`${record.artifact.path} (${record.artifact.mimeType}, ${record.artifact.byteCount} bytes)`,
+				).join("\n") + "\nTemporary originals may be removed by user/OS cleanup. Copy needed assets to persistent storage."
+					: "No image artifacts recorded on this branch.",
+				display: true,
+			});
 		},
 	});
 }
